@@ -54,8 +54,11 @@ constexpr std::uint64_t NativeFinishInventoryInteractionRva = 0x1A0780;
 constexpr std::uint64_t NativeFindAdvancedStashSlotByClassRva = 0x46D8F0;
 constexpr std::uint64_t NativeAttachSoundRva = 0x491960;
 constexpr std::uintptr_t NativeItemDataPointerOffset = 0x10;
+// The D2R item-data quality enum is the first field; ItemDataFlags follows at 0x18.
+constexpr std::uintptr_t NativeItemQualityOffset = 0x00;
 constexpr std::uintptr_t NativeItemFlagsOffset = 0x18;
 constexpr std::uint32_t NativeItemIdentifiedMask = 0x00000010U;
+static_assert(static_cast<std::uint32_t>(D2RL::Items::Quality::Normal) == 2U);
 constexpr std::uint8_t AdvancedStashCubeDestination = 2;
 // Native Advanced Stash withdrawal destinations: 0=cursor, 1=inventory, 2=Cube, 3=belt.
 constexpr std::uint8_t AdvancedStashInventoryDestination = 1;
@@ -203,7 +206,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.63",
+    .version     = "0.1.67",
     .author      = "MadMike",
     .description = "Upgrade gems, runes, and rejuvenation potions from Advanced Stash material tabs with Shift + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -321,6 +324,7 @@ std::vector<Recipe> Recipes;
 std::unordered_set<std::string> IncludedRecipeNames;
 std::vector<CraftingSlotLayout> CraftingSlotLayouts;
 std::unordered_map<std::uint32_t, std::int32_t> ItemClassByCode;
+std::unordered_set<std::uint32_t> AdvancedStashStackableItemCodes;
 std::unordered_set<std::uint32_t> GemItemCodes;
 std::unordered_set<std::uint32_t> RuneItemCodes;
 std::uint16_t GemUpgradeSoundId{};
@@ -1191,6 +1195,7 @@ auto CountItemRecords(const Table& table) -> std::int32_t {
 auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
     Recipes.clear();
     ItemClassByCode.clear();
+    AdvancedStashStackableItemCodes.clear();
     GemItemCodes.clear();
     RuneItemCodes.clear();
     const auto excelDirectory = ExcelDirectoryFromContext(context);
@@ -1291,6 +1296,7 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
     for (const auto& [code, stackable] : stackableByCode) {
         if (stackable) {
             stackableItemCodes.insert(code);
+            AdvancedStashStackableItemCodes.insert(code);
         }
     }
 
@@ -1862,10 +1868,11 @@ struct NativeOutputTransferState {
 };
 
 auto MarkAdvancedStashItemIdentified(void* nativeItem, std::uint32_t expectedCode) noexcept -> bool {
+    // A single-item stash slot may have a zero counter byte; the native item
+    // identity and type are the occupancy checks for this operation.
     if (nativeItem == nullptr || expectedCode == 0 || GetNativeUnitId == nullptr
-        || GetNativeItemCode == nullptr || GetAdvancedStashCounterByte == nullptr
-        || GetNativeUnitId(nativeItem) < 0 || GetNativeItemCode(nativeItem) != expectedCode
-        || GetAdvancedStashCounterByte(nativeItem) == 0) {
+        || GetNativeItemCode == nullptr
+        || GetNativeUnitId(nativeItem) < 0 || GetNativeItemCode(nativeItem) != expectedCode) {
         return false;
     }
 
@@ -1888,6 +1895,15 @@ auto MarkAdvancedStashItemIdentified(void* nativeItem, std::uint32_t expectedCod
         || bytesRead != sizeof(itemDataAddress)
         || itemDataAddress % alignof(std::uint32_t) != 0
         || itemDataAddress > std::numeric_limits<std::uintptr_t>::max() - NativeItemFlagsOffset - sizeof(std::uint32_t)) {
+        return false;
+    }
+
+    std::uint32_t quality{};
+    bytesRead = 0;
+    const auto* const itemQualityAddress = reinterpret_cast<const void*>(itemDataAddress + NativeItemQualityOffset);
+    if (!ReadProcessMemory(GetCurrentProcess(), itemQualityAddress, &quality, sizeof(quality), &bytesRead)
+        || bytesRead != sizeof(quality)
+        || quality != static_cast<std::uint32_t>(D2RL::Items::Quality::Normal)) {
         return false;
     }
 
@@ -2353,13 +2369,15 @@ auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* w
     }
     const Recipe* matchedRecipe{};
     for (const auto& recipe : Recipes) {
-        const bool usesClickedSlot = std::any_of(recipe.inputs.begin(), recipe.inputs.end(),
-            [slotCode](const Ingredient& ingredient) { return ingredient.code == slotCode; });
-        if (recipe.inputs.empty() || recipe.outputs.size() != 1 || !usesClickedSlot) {
+        // The first ingredient is the item being upgraded. Other ingredients
+        // (such as the gem cost for a rune upgrade) must not make their slots
+        // appear to have a competing upgrade recipe.
+        if (recipe.inputs.empty() || recipe.outputs.size() != 1
+            || recipe.inputs.front().code != slotCode) {
             continue;
         }
         if (matchedRecipe != nullptr) {
-            context->LogWarn("More than one valid one-output recipe matches this Crafting slot; refusing an ambiguous upgrade.");
+            context->LogWarn("More than one valid one-output recipe upgrades this Crafting slot; refusing an ambiguous upgrade.");
             return false;
         }
         matchedRecipe = &recipe;
@@ -2390,6 +2408,79 @@ auto __fastcall HandleAdvancedStashSlotInput(void* widget, std::uintptr_t eventS
     const AdvancedStashSlotInputHandler original = OriginalAdvancedStashSlotInputHandler;
     if (original != nullptr) {
         original(widget, eventState);
+    }
+}
+
+void __cdecl IdentifyLoadedAdvancedStashMaterials(const D2RL::PluginContext* context, void*) noexcept {
+    if (context == nullptr || context != LoadContext || MainImageBase == 0
+        || GetLocalDataContext == nullptr || GetLocalPlayer == nullptr
+        || GetAdvancedStashDestination == nullptr || FindAdvancedStashSlotByClass == nullptr
+        || GetNativeUnitId == nullptr || GetNativeItemCode == nullptr
+        || AdvancedStashStackableItemCodes.empty()) {
+        return;
+    }
+
+    const std::int32_t dataContext = GetLocalDataContext();
+    void* const nativePlayer = dataContext >= 0 ? GetLocalPlayer(dataContext) : nullptr;
+    void* const stashOwner = nativePlayer != nullptr ? GetAdvancedStashDestination(nativePlayer) : nullptr;
+    if (nativePlayer == nullptr || stashOwner == nullptr || GetNativeUnitId(nativePlayer) < 0
+        || GetNativeUnitId(stashOwner) < 0) {
+        return;
+    }
+
+    for (const std::uint32_t code : AdvancedStashStackableItemCodes) {
+        const auto itemClass = ItemClassByCode.find(code);
+        if (itemClass == ItemClassByCode.end()) {
+            continue;
+        }
+        void* const item = FindAdvancedStashSlotByClass(stashOwner, itemClass->second);
+        if (item != nullptr && GetNativeItemCode(item) == code) {
+            (void)MarkAdvancedStashItemIdentified(item, code);
+        }
+    }
+
+    // Loaded Advanced Stash stackables may lack D2R's identified bit until a
+    // normal item transfer rebuilds their state. Mark only native Normal-quality
+    // items before the player opens the stash; other qualities are left alone.
+}
+
+void __cdecl OnLocalPlayerReadyForMaterialIdentification(const D2RL::PluginContext* context,
+    const D2RL::Lifecycle::GameplayEvent* event, void*) noexcept {
+    if (context == nullptr || context != LoadContext
+        || !D2RL::Lifecycle::HasGameplayEventField(event, D2RL::Lifecycle::GameplayEventRequiredSize)
+        || event->kind != D2RL::Lifecycle::GameplayEventKind::LocalPlayerReady
+        || ThreadService == nullptr || ThreadService->runOnGameThread == nullptr
+        || OriginalAdvancedStashSlotInputHandler == nullptr) {
+        return;
+    }
+
+    const auto result = ThreadService->runOnGameThread(context, IdentifyLoadedAdvancedStashMaterials, nullptr);
+    if (result != D2RL::Threads::Result::Success) {
+        context->LogWarn("Could not queue the Advanced Stash material identification refresh after local-player readiness.");
+    }
+}
+
+auto InstallStashMaterialIdentificationListener(const D2RL::PluginContext* context) noexcept -> void {
+    if (context == nullptr || OriginalAdvancedStashSlotInputHandler == nullptr) {
+        return;
+    }
+
+    const D2RL::LifecycleService* lifecycle{};
+    if (context->QueryService(&lifecycle) != D2RL::ServiceQueryResult::Success
+        || !D2RL::HasLifecycleServiceField(lifecycle, D2RL::LifecycleServiceRequiredSize)) {
+        context->LogWarn("Automatic Advanced Stash material identification refresh is unavailable because the lifecycle service could not be queried.");
+        return;
+    }
+
+    const D2RL::Lifecycle::GameplayEventListener listener {
+        .structSize = D2RL::Lifecycle::GameplayEventListenerSize,
+        .kind       = D2RL::Lifecycle::GameplayEventKind::LocalPlayerReady,
+        .callback   = OnLocalPlayerReadyForMaterialIdentification,
+    };
+    D2RL::Lifecycle::ListenerHandle handle = D2RL::Lifecycle::InvalidHandle;
+    if (lifecycle->registerGameplayEventListener(context, &listener, &handle) != D2RL::Lifecycle::Result::Success
+        || handle == D2RL::Lifecycle::InvalidHandle) {
+        context->LogWarn("Automatic Advanced Stash material identification refresh could not register its local-player-ready listener.");
     }
 }
 
@@ -2850,6 +2941,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 
         LoadContext = context;
         InstallAdvancedStashSlotInputHook(context);
+        InstallStashMaterialIdentificationListener(context);
         InstallItemWidgetInputBridge(context);
         InstallConsumeCurrentInputHook(context);
         return true;
@@ -2886,6 +2978,7 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     ThreadService = nullptr;
     Recipes.clear();
     ItemClassByCode.clear();
+    AdvancedStashStackableItemCodes.clear();
     GemItemCodes.clear();
     RuneItemCodes.clear();
     GemUpgradeSoundId = 0;
