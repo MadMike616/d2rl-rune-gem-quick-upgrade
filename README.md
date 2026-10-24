@@ -14,8 +14,6 @@ The plugin reads the active mod's `cubemain.txt` and accepts enabled recipes tha
 
 Shift-right-click the recipe's primary input slot. Secondary ingredients, such as a gem required for a rune recipe, are withdrawn automatically when you click the rune slot; clicking the gem slot runs its own gem recipe instead.
 
-When the local player is ready, the plugin checks the active item tables for `AdvancedStashStackable = 1` items in the Advanced Stash and marks only Normal-quality items as identified. This keeps their tooltips correct on the first hover after entering a game, including for mod-specific crafting materials.
-
 Additional recipes must be enabled in `cubemain.txt`, use simple item-code inputs, and produce exactly one item. Every input and the output must exist in `misc.txt`, `armor.txt`, or `weapons.txt` with `AdvancedStashStackable` set to `1`, and its item type must exist in `itemtypes.txt`. The plugin reads these tables from the active mod and uses D2RLoader's compiled tables for missing files. Other custom recipes and recipes with unsupported conditions are ignored. The potion recipe is included only when the active recipe tables define it.
 
 ## Requirements and compatibility
