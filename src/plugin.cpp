@@ -203,7 +203,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.62",
+    .version     = "0.1.63",
     .author      = "MadMike",
     .description = "Upgrade gems, runes, and rejuvenation potions from Advanced Stash material tabs with Shift + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
