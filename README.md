@@ -16,9 +16,9 @@ Additional recipes must be enabled in `cubemain.txt`, use simple item-code input
 
 ## Requirements and compatibility
 
-- Windows, Diablo II: Resurrected build **93847**, and D2RLoader with PluginSDK ABI 4 support.
+- Windows, Diablo II: Resurrected, and D2RLoader with PluginSDK ABI 4 support. The plugin does not gate on a specific D2R version.
 - An Advanced Stash mod with dedicated material slots and the required inventory, item, and thread services.
-- The plugin's native Advanced Stash input path is fingerprint-checked for the supported game build and fails closed when the expected game structures do not match.
+- The plugin's native Advanced Stash input path checks function fingerprints and expected UI vtables, and skips the native path when those layouts do not match. It has been validated on D2R build **93847**.
 - The plugin reads loose Excel tables from the active mod when available and falls back to D2RLoader's compiled Excel data. It reads `bankexpansionlayouthd.json` for material-slot coordinates when present; otherwise it uses built-in coordinates.
 - Works in a local game or as the authoritative TCP/IP host. Controller input and remote TCP/IP clients are not supported.
 

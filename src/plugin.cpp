@@ -56,7 +56,6 @@ constexpr std::uint64_t NativeAttachSoundRva = 0x491960;
 constexpr std::uintptr_t NativeItemDataPointerOffset = 0x10;
 constexpr std::uintptr_t NativeItemFlagsOffset = 0x18;
 constexpr std::uint32_t NativeItemIdentifiedMask = 0x00000010U;
-constexpr std::string_view SupportedItemDataBuild = "93847";
 constexpr std::uint8_t AdvancedStashCubeDestination = 2;
 // Native Advanced Stash withdrawal destinations: 0=cursor, 1=inventory, 2=Cube, 3=belt.
 constexpr std::uint8_t AdvancedStashInventoryDestination = 1;
@@ -137,7 +136,8 @@ constexpr std::array<std::uint8_t, 32> NativeFinishInventoryInteractionExpected{
     0x00, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x05, 0x2D,
     0xAB, 0x82, 0x02, 0x48, 0x33, 0xC4, 0x48, 0x89,
 };
-// Captured from the active D2RLoader process for the supported D2R build.
+// Captured from the active D2RLoader process. The live fingerprint checks below
+// keep this build-specific native path disabled when the game layout differs.
 constexpr std::array<std::uint8_t, 32> NativeFindAdvancedStashSlotByClassExpected{
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
     0xEC, 0x20, 0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0xBA,
@@ -1861,11 +1861,8 @@ struct NativeOutputTransferState {
     bool transferred{};
 };
 
-auto MarkAdvancedStashItemIdentified(const D2RL::PluginContext* context, void* nativeItem,
-    std::uint32_t expectedCode) noexcept -> bool {
-    const char* const buildName = D2RL::GetBuildName(context);
-    if (buildName == nullptr || std::string_view(buildName) != SupportedItemDataBuild
-        || nativeItem == nullptr || expectedCode == 0 || GetNativeUnitId == nullptr
+auto MarkAdvancedStashItemIdentified(void* nativeItem, std::uint32_t expectedCode) noexcept -> bool {
+    if (nativeItem == nullptr || expectedCode == 0 || GetNativeUnitId == nullptr
         || GetNativeItemCode == nullptr || GetAdvancedStashCounterByte == nullptr
         || GetNativeUnitId(nativeItem) < 0 || GetNativeItemCode(nativeItem) != expectedCode
         || GetAdvancedStashCounterByte(nativeItem) == 0) {
@@ -1969,7 +1966,7 @@ void __cdecl TransferNativeOutputToAdvancedStash(const D2RL::PluginContext* cont
         const auto itemClass = ItemClassByCode.find(state->expectedCode);
         void* const stashItem = itemClass != ItemClassByCode.end() && FindAdvancedStashSlotByClass != nullptr
             ? FindAdvancedStashSlotByClass(destination, itemClass->second) : nullptr;
-        if (!MarkAdvancedStashItemIdentified(context, stashItem, state->expectedCode)) {
+        if (!MarkAdvancedStashItemIdentified(stashItem, state->expectedCode)) {
             if (context != nullptr) {
                 context->LogWarn("The output was deposited, but the Advanced Stash slot's identified flag could not be updated.");
             }
@@ -2248,7 +2245,7 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
                 FinishNativeSlotUpgrade();
                 return;
             }
-            (void)MarkAdvancedStashItemIdentified(context, stashItem, ingredient.code);
+            (void)MarkAdvancedStashItemIdentified(stashItem, ingredient.code);
             withdrawalItems.emplace_back(stashItem, static_cast<std::uint8_t>(ingredient.quantity));
         }
 
@@ -2385,7 +2382,7 @@ auto __fastcall HandleAdvancedStashSlotInput(void* widget, std::uintptr_t eventS
             void* const item = GetAdvancedStashSlotCounterItem(widget);
             const std::uint32_t code = item != nullptr ? GetNativeItemCode(item) : 0;
             if (GemItemCodes.contains(code) || RuneItemCodes.contains(code)) {
-                (void)MarkAdvancedStashItemIdentified(context, item, code);
+                (void)MarkAdvancedStashItemIdentified(item, code);
             }
         }
     }
