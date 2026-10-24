@@ -1,3 +1,12 @@
 # Prefer the Horadric Cube when it is in Inventory; without one, stage ingredients in Inventory.
 # Set to false to require and use the Horadric Cube.
 allow_without_cube = false
+
+# Add exact recipe descriptions from the active mod's cubemain.txt, in quotes
+# and separated by commas. The recipe must be enabled, use simple item-code
+# inputs, and produce exactly one output. Every ingredient and output must
+# exist in misc.txt, armor.txt, or weapons.txt with AdvancedStashStackable = 1,
+# and each item's type must exist in itemtypes.txt.
+# Example, only if the mod defines these exact descriptions:
+# included-recipes = ["2 Corrupted Orb -> Exalted Orb", "2 Exalted Orbs -> Divine Orb"]
+included-recipes = []

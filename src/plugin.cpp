@@ -64,12 +64,16 @@ constexpr std::uint8_t AdvancedStashPage = 4;
 constexpr std::uint8_t MainInventoryPage = 0;
 constexpr std::uint8_t RecipeInputCount = 3;
 constexpr std::uint32_t MaximumWithdrawalPolls = 300;
-constexpr std::size_t MaximumConfigBytes = 4096;
+constexpr std::size_t MaximumConfigBytes = 16384;
 constexpr std::size_t MaximumTemporarySpriteCodes = MaxRecipeInputs + MaxRecipeOutputs;
 constexpr std::uint32_t HoradricCubeCode = D2RL::Items::MakeItemCode("box");
 constexpr std::uint32_t RejuvenationPotionCode = D2RL::Items::MakeItemCode("rvs");
 constexpr std::uint32_t FullRejuvenationPotionCode = D2RL::Items::MakeItemCode("rvl");
-constexpr char DefaultConfig[] = "allow_without_cube = false\n";
+constexpr char DefaultConfig[] =
+    "# Add exact recipe descriptions from the active mod's cubemain.txt.\n"
+    "# Custom recipes require one output and stackable ingredients and output.\n"
+    "included-recipes = []\n"
+    "allow_without_cube = false\n";
 constexpr std::uint64_t AdvancedStashRightClickCommand = 0x02D5172CAC7C938CULL;
 constexpr std::uint64_t InventoryItemRendererRva = 0x2A72D0;
 constexpr std::array<std::uint8_t, 32> AdvancedStashSlotInputExpected{
@@ -199,7 +203,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.61",
+    .version     = "0.1.62",
     .author      = "MadMike",
     .description = "Upgrade gems, runes, and rejuvenation potions from Advanced Stash material tabs with Shift + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -314,6 +318,7 @@ struct ItemProgression {
 };
 
 std::vector<Recipe> Recipes;
+std::unordered_set<std::string> IncludedRecipeNames;
 std::vector<CraftingSlotLayout> CraftingSlotLayouts;
 std::unordered_map<std::uint32_t, std::int32_t> ItemClassByCode;
 std::unordered_set<std::uint32_t> GemItemCodes;
@@ -399,8 +404,117 @@ auto ReadTomlBoolean(std::string_view config, std::string_view key, bool& value)
     return false;
 }
 
+auto ReadTomlStringArray(std::string_view config, std::string_view key,
+    std::vector<std::string>& values, bool& found) -> bool {
+    found = false;
+    std::size_t lineStart = 0;
+    while (lineStart < config.size()) {
+        const std::size_t lineEnd = config.find('\n', lineStart);
+        std::string_view line = config.substr(lineStart,
+            lineEnd == std::string_view::npos ? config.size() - lineStart : lineEnd - lineStart);
+        bool inString = false;
+        bool escaped = false;
+        for (std::size_t index = 0; index < line.size(); ++index) {
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (line[index] == '\\') {
+                    escaped = true;
+                } else if (line[index] == '"') {
+                    inString = false;
+                }
+            } else if (line[index] == '"') {
+                inString = true;
+            } else if (line[index] == '#') {
+                line = line.substr(0, index);
+                break;
+            }
+        }
+
+        line = TrimView(line);
+        const std::size_t equals = line.find('=');
+        if (equals != std::string_view::npos && TrimView(line.substr(0, equals)) == key) {
+            found = true;
+            std::string_view array = TrimView(line.substr(equals + 1));
+            if (array.empty() || array.front() != '[') {
+                return false;
+            }
+            array.remove_prefix(1);
+            std::vector<std::string> parsed;
+            while (true) {
+                array = TrimView(array);
+                if (array.empty()) {
+                    return false;
+                }
+                if (array.front() == ']') {
+                    array.remove_prefix(1);
+                    if (!TrimView(array).empty()) {
+                        return false;
+                    }
+                    values = std::move(parsed);
+                    return true;
+                }
+                if (array.front() != '"') {
+                    return false;
+                }
+                array.remove_prefix(1);
+                std::string value;
+                bool closed = false;
+                while (!array.empty()) {
+                    const char character = array.front();
+                    array.remove_prefix(1);
+                    if (character == '"') {
+                        closed = true;
+                        break;
+                    }
+                    if (character == '\\') {
+                        if (array.empty()) {
+                            return false;
+                        }
+                        const char escapedCharacter = array.front();
+                        array.remove_prefix(1);
+                        switch (escapedCharacter) {
+                        case '"': value.push_back('"'); break;
+                        case '\\': value.push_back('\\'); break;
+                        case 'b': value.push_back('\b'); break;
+                        case 't': value.push_back('\t'); break;
+                        case 'n': value.push_back('\n'); break;
+                        case 'f': value.push_back('\f'); break;
+                        case 'r': value.push_back('\r'); break;
+                        default: return false;
+                        }
+                    } else {
+                        value.push_back(character);
+                    }
+                }
+                if (!closed) {
+                    return false;
+                }
+                parsed.push_back(std::move(value));
+                array = TrimView(array);
+                if (array.empty()) {
+                    return false;
+                }
+                if (array.front() == ',') {
+                    array.remove_prefix(1);
+                    continue;
+                }
+                if (array.front() != ']') {
+                    return false;
+                }
+            }
+        }
+        if (lineEnd == std::string_view::npos) {
+            break;
+        }
+        lineStart = lineEnd + 1;
+    }
+    return true;
+}
+
 auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
     AllowWithoutCube = false;
+    IncludedRecipeNames.clear();
     if (context == nullptr || !context->EnsureConfig(DefaultConfig)) {
         if (context != nullptr) {
             context->LogWarn("Could not create or access the plugin TOML config; Cube staging remains required.");
@@ -416,12 +530,25 @@ auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
             context->LogWarn("Could not read the plugin TOML config; Cube staging remains required.");
             return;
         }
+        const std::string_view config(buffer.data());
         bool configuredValue = false;
-        if (!ReadTomlBoolean(std::string_view(buffer.data()), "allow_without_cube", configuredValue)) {
+        if (ReadTomlBoolean(config, "allow_without_cube", configuredValue)) {
+            AllowWithoutCube = configuredValue;
+        } else {
             context->LogWarn("The plugin TOML config has no valid allow_without_cube boolean; Cube staging remains required.");
-            return;
         }
-        AllowWithoutCube = configuredValue;
+        std::vector<std::string> includedRecipes;
+        bool includedRecipesFound{};
+        if (ReadTomlStringArray(config, "included-recipes", includedRecipes, includedRecipesFound)) {
+            for (auto& recipeName : includedRecipes) {
+                recipeName = Lower(Trim(recipeName));
+                if (!recipeName.empty()) {
+                    IncludedRecipeNames.insert(std::move(recipeName));
+                }
+            }
+        } else if (includedRecipesFound) {
+            context->LogWarn("The plugin TOML included-recipes value is invalid; custom recipes are disabled.");
+        }
     } catch (...) {
         context->LogWarn("Could not parse the plugin TOML config; Cube staging remains required.");
     }
@@ -1094,8 +1221,11 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
 
     const std::int32_t armorRecordCount = CountItemRecords(armor);
     const std::int32_t weaponRecordCount = CountItemRecords(weapons);
-    if (armorRecordCount < 0 || weaponRecordCount < 0
-        || armorRecordCount > std::numeric_limits<std::int32_t>::max() - weaponRecordCount) {
+    const std::int32_t miscRecordCount = CountItemRecords(misc);
+    if (armorRecordCount < 0 || weaponRecordCount < 0 || miscRecordCount < 0
+        || armorRecordCount > std::numeric_limits<std::int32_t>::max() - weaponRecordCount
+        || armorRecordCount + weaponRecordCount
+            > std::numeric_limits<std::int32_t>::max() - miscRecordCount) {
         context->LogWarn("Rune Gem Quick Upgrade could not establish native item-class offsets from armor.txt and weapons.txt.");
         return false;
     }
@@ -1123,22 +1253,56 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
     }
 
     std::unordered_map<std::uint32_t, ItemProgression> progressionByCode;
-    std::int32_t itemClass = armorRecordCount + weaponRecordCount;
+    std::unordered_map<std::uint32_t, bool> stackableByCode;
+    auto addItemTable = [&](const Table& table, std::int32_t firstItemClass) -> std::int32_t {
+        std::int32_t itemClass = firstItemClass;
+        const std::size_t stackableColumn = ColumnIndex(table, "AdvancedStashStackable");
+        for (const auto& row : table.rows) {
+            const auto codeText = Cell(table, row, "code");
+            if (Trim(codeText).empty()) {
+                continue;
+            }
+            std::uint32_t code{};
+            if (ItemCode(codeText, code)) {
+                ItemClassByCode.insert_or_assign(code, itemClass);
+                const std::string itemType = Lower(Trim(Cell(table, row, "type")));
+                const bool hasKnownItemType = !itemType.empty() && typeParents.contains(itemType);
+                const bool stackable = hasKnownItemType && stackableColumn < row.size()
+                    && Trim(row[stackableColumn]) == "1";
+                const auto [found, inserted] = stackableByCode.emplace(code, stackable);
+                if (!inserted) {
+                    found->second = found->second && stackable;
+                }
+            }
+            ++itemClass;
+        }
+        return itemClass;
+    };
+    const std::int32_t nextArmorClass = addItemTable(armor, 0);
+    const std::int32_t nextWeaponClass = addItemTable(weapons, armorRecordCount);
+    const std::int32_t nextMiscClass = addItemTable(misc, armorRecordCount + weaponRecordCount);
+    if (nextArmorClass != armorRecordCount
+        || nextWeaponClass != armorRecordCount + weaponRecordCount
+        || nextMiscClass != armorRecordCount + weaponRecordCount + miscRecordCount) {
+        context->LogWarn("Rune Gem Quick Upgrade could not establish native item-class offsets from the active item tables.");
+        return false;
+    }
+    std::unordered_set<std::uint32_t> stackableItemCodes;
+    for (const auto& [code, stackable] : stackableByCode) {
+        if (stackable) {
+            stackableItemCodes.insert(code);
+        }
+    }
+
     for (const auto& row : misc.rows) {
         std::uint32_t code{};
         const auto codeText = Cell(misc, row, "code");
         if (Trim(codeText).empty()) {
             continue;
         }
-        if (itemClass == std::numeric_limits<std::int32_t>::max()) {
-            context->LogWarn("Rune Gem Quick Upgrade item-class map exceeded the native integer range.");
-            return false;
-        }
-        const std::int32_t currentClass = itemClass++;
         if (!ItemCode(codeText, code)) {
             continue;
         }
-        ItemClassByCode.insert_or_assign(code, currentClass);
         bool isRune = false;
         if (!IsGemOrRuneType(Cell(misc, row, "type"), typeParents, isRune)) {
             continue;
@@ -1182,6 +1346,9 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
             continue;
         }
 
+        const std::string description = Lower(Trim(Cell(cube, row, "description")));
+        const bool includedByConfig = !description.empty() && IncludedRecipeNames.contains(description);
+
         Recipe recipe{};
         recipe.sourceRow = static_cast<std::uint32_t>(rowIndex);
         bool valid = true;
@@ -1193,7 +1360,8 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
             }
             Ingredient ingredient{};
             if (!IsSimpleCodeSpec(value, true, ingredient)
-                || (!progressionByCode.contains(ingredient.code) && ingredient.code != RejuvenationPotionCode)) {
+                || (!progressionByCode.contains(ingredient.code) && ingredient.code != RejuvenationPotionCode
+                    && (!includedByConfig || !stackableItemCodes.contains(ingredient.code)))) {
                 valid = false;
                 break;
             }
@@ -1225,13 +1393,29 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
             }
             Ingredient output{};
             if (!IsSimpleCodeSpec(value, false, output)
-                || (!progressionByCode.contains(output.code) && output.code != FullRejuvenationPotionCode)) {
+                || (!progressionByCode.contains(output.code) && output.code != FullRejuvenationPotionCode
+                    && (!includedByConfig || !stackableItemCodes.contains(output.code)))) {
                 valid = false;
                 break;
             }
             recipe.outputs.push_back(output.code);
         }
         if (!valid || recipe.outputs.empty() || recipe.outputs.size() > MaxRecipeOutputs) {
+            continue;
+        }
+
+        // A TOML entry opts this enabled CubeMain row into the generic path
+        // only when every affected item is a validated, dedicated-slot item.
+        if (includedByConfig) {
+            const bool everyAffectedItemIsStackable = recipe.outputs.size() == 1
+                && std::all_of(recipe.inputs.begin(), recipe.inputs.end(), [&](const Ingredient& ingredient) {
+                    return ingredient.quantity <= std::numeric_limits<std::uint8_t>::max()
+                        && stackableItemCodes.contains(ingredient.code);
+                })
+                && stackableItemCodes.contains(recipe.outputs.front());
+            if (everyAffectedItemIsStackable) {
+                Recipes.push_back(std::move(recipe));
+            }
             continue;
         }
 
@@ -2172,8 +2356,9 @@ auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* w
     }
     const Recipe* matchedRecipe{};
     for (const auto& recipe : Recipes) {
-        if (recipe.inputs.empty() || recipe.outputs.size() != 1
-            || recipe.inputs.front().code != slotCode) {
+        const bool usesClickedSlot = std::any_of(recipe.inputs.begin(), recipe.inputs.end(),
+            [slotCode](const Ingredient& ingredient) { return ingredient.code == slotCode; });
+        if (recipe.inputs.empty() || recipe.outputs.size() != 1 || !usesClickedSlot) {
             continue;
         }
         if (matchedRecipe != nullptr) {

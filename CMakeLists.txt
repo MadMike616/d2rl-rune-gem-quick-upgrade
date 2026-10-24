@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(RuneGemQuickUpgrade VERSION 0.1.61 LANGUAGES CXX RC)
+project(RuneGemQuickUpgrade VERSION 0.1.62 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
