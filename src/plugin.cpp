@@ -27,6 +27,9 @@
 namespace {
 
 constexpr char PluginId[] = "rune-gem-quick-upgrade";
+constexpr std::uint32_t ModifierGenericKeyBit = 1U << 0U;
+constexpr std::uint32_t ModifierLeftKeyBit = 1U << 1U;
+constexpr std::uint32_t ModifierRightKeyBit = 1U << 2U;
 constexpr std::uint32_t MaxRecipeInputs = 64;
 constexpr std::uint32_t MaxRecipeOutputs = 64;
 constexpr std::uint32_t MaxInputQuantity = 4096;
@@ -206,22 +209,32 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.67",
+    .version     = "0.1.71",
     .author      = "MadMike",
-    .description = "Upgrade gems, runes, and rejuvenation potions from Advanced Stash material tabs with Shift + right-click.",
+    .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
 };
 
 const D2RL::InventoryService* InventoryService{};
 const D2RL::ItemService* ItemService{};
 const D2RL::ThreadService* ThreadService{};
+const D2RL::InputService* InputApiService{};
+D2RL::Input::KeyListenerHandle ModifierKeyListener{D2RL::Input::InvalidKeyListenerHandle};
 const D2RL::PluginContext* LoadContext{};
 std::atomic_bool RequestInFlight{};
 std::atomic_bool HideTemporaryInventoryWidgets{};
+std::atomic_bool ModifierKeyListenerActive{};
+std::atomic_uint32_t AltKeyState{};
+std::atomic_uint32_t ShiftKeyState{};
 bool AllowWithoutCube{};
-thread_local bool ShiftRightClickInputMessageActive{};
+enum class SlotAction : std::uint8_t {
+    None,
+    Upgrade,
+    Downgrade,
+};
+
+thread_local SlotAction ActiveSlotAction{SlotAction::None};
 thread_local void* ActiveInputWidget{};
-thread_local std::uintptr_t ActiveInputPayload{};
 AdvancedStashSlotInputHandler OriginalAdvancedStashSlotInputHandler{};
 ItemWidgetInputHandler OriginalItemWidgetInputHandler{};
 CurrentInputConsumer OriginalCurrentInputConsumer{};
@@ -338,13 +351,15 @@ struct Table {
 struct PendingSlotUpgrade {
     void* widget{};
     D2RL::PlayerHandle player{D2RL::InvalidPlayerHandle};
-    std::uint32_t inputCode{};
-    std::uint32_t outputCode{};
+    std::uint32_t clickedCode{};
     std::uint32_t sourceRow{};
     std::uint32_t pollCount{};
+    SlotAction action{SlotAction::None};
     bool withdrawalSent{};
     D2RL::Items::ItemContainer stagingContainer{D2RL::Items::ItemContainer::Cube};
     std::vector<D2RL::Items::ItemInfo> stagedItemsBefore;
+    std::vector<Ingredient> transactionIngredients;
+    std::vector<Ingredient> createdItems;
 };
 
 PendingSlotUpgrade PendingSlotRequest{};
@@ -741,19 +756,8 @@ auto LoadCraftingSlotLayoutsFromFile(const std::filesystem::path& layoutPath) ->
             break;
         }
         const std::string_view slotObject(json.data() + objectStart, objectEnd - objectStart + 1);
-        const std::size_t rectField = slotObject.find("\"rect\"");
-        const std::size_t rectStart = rectField == std::string_view::npos
-            ? std::string_view::npos : slotObject.find('{', rectField);
-        const std::size_t rectEnd = rectStart == std::string_view::npos
-            ? std::string_view::npos : slotObject.find('}', rectStart);
         CraftingSlotLayout slot{};
-        const bool parsed = rectStart != std::string_view::npos && rectEnd != std::string_view::npos
-            && JsonStringField(slotObject, "itemCode", slot.itemCode)
-            && JsonIntegerField(slotObject.substr(rectStart, rectEnd - rectStart + 1), "x", slot.x)
-            && JsonIntegerField(slotObject.substr(rectStart, rectEnd - rectStart + 1), "y", slot.y)
-            && JsonIntegerField(slotObject.substr(rectStart, rectEnd - rectStart + 1), "width", slot.width)
-            && JsonIntegerField(slotObject.substr(rectStart, rectEnd - rectStart + 1), "height", slot.height);
-        if (parsed && !slot.itemCode.empty() && slot.width > 0 && slot.height > 0) {
+        if (JsonStringField(slotObject, "itemCode", slot.itemCode) && !slot.itemCode.empty()) {
             CraftingSlotLayouts.push_back(std::move(slot));
         }
         position = objectEnd + 1;
@@ -1585,11 +1589,12 @@ auto GetAddedStagedQuantity(const std::vector<D2RL::Items::ItemInfo>& before,
     return afterQuantity > beforeQuantity ? afterQuantity - beforeQuantity : 0;
 }
 
-auto BuildStagedTransactionInputs(const Recipe& recipe, const std::vector<D2RL::Items::ItemInfo>& before,
+auto BuildStagedTransactionInputs(const std::vector<Ingredient>& ingredients,
+    const std::vector<D2RL::Items::ItemInfo>& before,
     const std::vector<D2RL::Items::ItemInfo>& after,
     D2RL::Items::ItemContainer container,
     std::vector<D2RL::Items::TransactionInput>& transactionInputs) -> bool {
-    if (recipe.inputs.empty()) {
+    if (ingredients.empty()) {
         return false;
     }
 
@@ -1597,7 +1602,7 @@ auto BuildStagedTransactionInputs(const Recipe& recipe, const std::vector<D2RL::
     baselineByHandle.reserve(before.size());
     for (const auto& item : before) {
         if (item.container == container
-            && std::any_of(recipe.inputs.begin(), recipe.inputs.end(), [&](const Ingredient& ingredient) {
+            && std::any_of(ingredients.begin(), ingredients.end(), [&](const Ingredient& ingredient) {
                 return ingredient.code == item.code;
             })) {
             baselineByHandle.insert_or_assign(item.handle, GetLogicalQuantity(item));
@@ -1608,7 +1613,7 @@ auto BuildStagedTransactionInputs(const Recipe& recipe, const std::vector<D2RL::
     addedByHandle.reserve(after.size());
     for (const auto& item : after) {
         if (item.container != container
-            || std::none_of(recipe.inputs.begin(), recipe.inputs.end(), [&](const Ingredient& ingredient) {
+            || std::none_of(ingredients.begin(), ingredients.end(), [&](const Ingredient& ingredient) {
                 return ingredient.code == item.code;
             })) {
             continue;
@@ -1623,7 +1628,7 @@ auto BuildStagedTransactionInputs(const Recipe& recipe, const std::vector<D2RL::
 
     std::unordered_map<D2RL::ItemHandle, std::uint32_t> takeByHandle;
     takeByHandle.reserve(after.size());
-    for (const auto& ingredient : recipe.inputs) {
+    for (const auto& ingredient : ingredients) {
         std::uint32_t remaining = ingredient.quantity;
         for (const auto& item : after) {
             if (remaining == 0) {
@@ -1836,24 +1841,43 @@ auto FinishNativeSlotUpgrade() noexcept -> void {
     RequestInFlight.store(false, std::memory_order_release);
 }
 
-auto QueueNativeSlotUpgrade(const D2RL::PluginContext* context, void* widget, std::uint32_t inputCode,
-    const Recipe& recipe) noexcept -> bool {
+auto QueueNativeSlotOperation(const D2RL::PluginContext* context, void* widget, std::uint32_t clickedCode,
+    const Recipe& recipe, SlotAction action) noexcept -> bool {
+    if (recipe.inputs.empty() || recipe.outputs.size() != 1
+        || (action != SlotAction::Upgrade && action != SlotAction::Downgrade)) {
+        return false;
+    }
     bool expected = false;
     if (!RequestInFlight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return true;
     }
-    PendingSlotRequest = {
-        .widget = widget,
-        .player = D2RL::InvalidPlayerHandle,
-        .inputCode = inputCode,
-        .outputCode = recipe.outputs.front(),
-        .sourceRow = recipe.sourceRow,
-        .stagingContainer = D2RL::Items::ItemContainer::Cube,
-    };
-    PublishTemporarySpriteCodes(recipe);
+    try {
+        PendingSlotRequest = PendingSlotUpgrade{};
+        PendingSlotRequest.widget = widget;
+        PendingSlotRequest.player = D2RL::InvalidPlayerHandle;
+        PendingSlotRequest.clickedCode = clickedCode;
+        PendingSlotRequest.sourceRow = recipe.sourceRow;
+        PendingSlotRequest.action = action;
+        PendingSlotRequest.stagingContainer = D2RL::Items::ItemContainer::Cube;
+        if (action == SlotAction::Downgrade) {
+            PendingSlotRequest.transactionIngredients.push_back({ recipe.outputs.front(), 1 });
+            PendingSlotRequest.createdItems = recipe.inputs;
+        } else {
+            PendingSlotRequest.transactionIngredients = recipe.inputs;
+            PendingSlotRequest.createdItems.reserve(recipe.outputs.size());
+            for (const std::uint32_t code : recipe.outputs) {
+                PendingSlotRequest.createdItems.push_back({ code, 1 });
+            }
+        }
+        PublishTemporarySpriteCodes(recipe);
+    } catch (...) {
+        context->LogError("Could not prepare the Crafting-slot transaction; no stash items were withdrawn.");
+        FinishNativeSlotUpgrade();
+        return false;
+    }
     const auto result = ThreadService->runOnGameThread(context, BeginNativeSlotUpgradeOnGameThread, nullptr);
     if (result != D2RL::Threads::Result::Success) {
-        context->LogWarn("Could not queue the Crafting-slot upgrade on the authoritative game thread; no stash item was withdrawn.");
+        context->LogWarn("Could not queue the Crafting-slot operation on the authoritative game thread; no stash item was withdrawn.");
         FinishNativeSlotUpgrade();
         return false;
     }
@@ -1991,96 +2015,133 @@ void __cdecl TransferNativeOutputToAdvancedStash(const D2RL::PluginContext* cont
     FinishInventoryInteraction(3, nullptr, 0, 0, false);
 }
 
-auto CreateRecipeOutputAndDeposit(const D2RL::PluginContext* context, const Recipe& recipe,
-    const std::vector<D2RL::Items::TransactionInput>& inputs) noexcept -> bool {
-    if (inputs.empty() || ItemService == nullptr || ItemService->executeTransaction == nullptr
+auto CreateRecipeItemsAndDeposit(const D2RL::PluginContext* context, const Recipe& recipe,
+    const std::vector<D2RL::Items::TransactionInput>& inputs,
+    const std::vector<Ingredient>& createdItems) noexcept -> bool {
+    if (inputs.empty() || createdItems.empty() || ItemService == nullptr
+        || ItemService->executeTransaction == nullptr || ItemService->editItem == nullptr
         || ItemService->editNativeItem == nullptr) {
         context->LogWarn("The item transaction or native transfer service is unavailable; withdrawn ingredients remain in their staging container.");
         return false;
     }
 
-    D2RL::Items::ItemCreateSpec output {
-        .structSize = D2RL::Items::ItemCreateSpecSize,
-        .code = recipe.outputs.front(),
-        .quality = D2RL::Items::Quality::Normal,
-        .qualityRecordId = D2RL::Items::RandomQualityRecord,
-        .itemLevel = 1,
-        .seedMode = D2RL::Items::SeedMode::Random,
-        .quantity = D2RL::Items::DefaultValue,
-        .durability = D2RL::Items::DefaultValue,
-        .stateFlags = D2RL::Items::ItemStateIdentified,
-        .destination = {
-            .structSize = D2RL::Items::ItemDestinationSize,
-            .container = D2RL::Items::ItemContainer::Inventory,
-            .placement = D2RL::Items::Placement::Automatic,
-            .x = 0,
-            .y = 0,
-        },
-    };
-    D2RL::ItemHandle outputHandle{D2RL::InvalidItemHandle};
-    const D2RL::Items::Transaction transaction {
-        .structSize = D2RL::Items::TransactionSize,
-        .player = PendingSlotRequest.player,
-        .inputCount = static_cast<std::uint32_t>(inputs.size()),
-        .outputCount = 1,
-        .inputs = inputs.data(),
-        .outputs = &output,
-        .outputItems = &outputHandle,
-        .outputCapacity = 1,
-    };
-    D2RL::Items::TransactionResult result {
-        .structSize = D2RL::Items::TransactionResultSize,
-    };
-    const auto transactionResult = ItemService->executeTransaction(context, &transaction, &result);
-    if (transactionResult != D2RL::Items::Result::Success || result.outputCount != 1
-        || outputHandle == D2RL::InvalidItemHandle) {
-        char message[192]{};
-        std::snprintf(message, sizeof(message),
-            "Recipe row %u transaction failed with result %u; the staged ingredients were not consumed.",
-            recipe.sourceRow, static_cast<std::uint32_t>(transactionResult));
-        context->LogWarn(message);
+    try {
+        std::vector<Ingredient> individualItems;
+        for (const auto& createdItem : createdItems) {
+            if (createdItem.code == 0 || createdItem.quantity == 0
+                || createdItem.quantity > std::numeric_limits<std::uint8_t>::max()
+                || !ItemClassByCode.contains(createdItem.code)
+                || individualItems.size() + createdItem.quantity > D2RL::Items::MaxTransactionOutputs) {
+                context->LogWarn("A recipe output could not be expanded into validated Inventory items; staged ingredients remain available.");
+                return false;
+            }
+            for (std::uint32_t count = 0; count < createdItem.quantity; ++count) {
+                individualItems.push_back({ createdItem.code, 1 });
+            }
+        }
+
+        std::vector<D2RL::Items::ItemCreateSpec> outputs;
+        outputs.reserve(individualItems.size());
+        for (const auto& createdItem : individualItems) {
+            outputs.push_back({
+                .structSize = D2RL::Items::ItemCreateSpecSize,
+                .code = createdItem.code,
+                .quality = D2RL::Items::Quality::Normal,
+                .qualityRecordId = D2RL::Items::RandomQualityRecord,
+                .itemLevel = 1,
+                .seedMode = D2RL::Items::SeedMode::Random,
+                .quantity = D2RL::Items::DefaultValue,
+                .durability = D2RL::Items::DefaultValue,
+                .stateFlags = D2RL::Items::ItemStateIdentified,
+                .destination = {
+                    .structSize = D2RL::Items::ItemDestinationSize,
+                    .container = D2RL::Items::ItemContainer::Inventory,
+                    .placement = D2RL::Items::Placement::Automatic,
+                    .x = 0,
+                    .y = 0,
+                },
+            });
+        }
+
+        std::vector<D2RL::ItemHandle> outputHandles(individualItems.size(), D2RL::InvalidItemHandle);
+        const D2RL::Items::Transaction transaction {
+            .structSize = D2RL::Items::TransactionSize,
+            .player = PendingSlotRequest.player,
+            .inputCount = static_cast<std::uint32_t>(inputs.size()),
+            .outputCount = static_cast<std::uint32_t>(outputs.size()),
+            .inputs = inputs.data(),
+            .outputs = outputs.data(),
+            .outputItems = outputHandles.data(),
+            .outputCapacity = static_cast<std::uint32_t>(outputHandles.size()),
+        };
+        D2RL::Items::TransactionResult result {
+            .structSize = D2RL::Items::TransactionResultSize,
+        };
+        const auto transactionResult = ItemService->executeTransaction(context, &transaction, &result);
+        if (transactionResult != D2RL::Items::Result::Success) {
+            char message[192]{};
+            std::snprintf(message, sizeof(message),
+                "Recipe row %u transaction failed with result %u; the staged ingredients were not consumed.",
+                recipe.sourceRow, static_cast<std::uint32_t>(transactionResult));
+            context->LogWarn(message);
+            return false;
+        }
+        if (result.outputCount != static_cast<std::uint32_t>(individualItems.size())
+            || std::any_of(outputHandles.begin(), outputHandles.end(), [](D2RL::ItemHandle handle) {
+                return handle == D2RL::InvalidItemHandle;
+            })) {
+            context->LogWarn("The recipe transaction committed, but its output handles could not be verified; check Inventory and the affected material slots.");
+            return false;
+        }
+
+        for (std::size_t index = 0; index < individualItems.size(); ++index) {
+            const auto& createdItem = individualItems[index];
+            const D2RL::ItemHandle outputHandle = outputHandles[index];
+            D2RL::Items::ItemInfo outputInfo {
+                .structSize = D2RL::Items::ItemInfoSize,
+            };
+            if (ItemService->getItemInfo(context, outputHandle, &outputInfo) != D2RL::Items::Result::Success
+                || outputInfo.code != createdItem.code
+                || GetLogicalQuantity(outputInfo) != 1
+                || outputInfo.container != D2RL::Items::ItemContainer::Inventory
+                || outputInfo.inventoryPage != MainInventoryPage) {
+                context->LogWarn("Recipe transaction created an item whose inventory identity could not be verified; check Inventory for recovery.");
+                return false;
+            }
+
+            const D2RL::Items::ItemEdit identifyEdit {
+                .structSize = D2RL::Items::ItemEditSize,
+                .fields = D2RL::Items::EditFieldBit(D2RL::Items::EditField::Identified),
+                .stateFlags = D2RL::Items::ItemStateIdentified,
+            };
+            if (ItemService->editItem(context, PendingSlotRequest.player, outputHandle, &identifyEdit)
+                    != D2RL::Items::Result::Success
+                || ItemService->getItemInfo(context, outputHandle, &outputInfo) != D2RL::Items::Result::Success
+                || outputInfo.code != createdItem.code
+                || GetLogicalQuantity(outputInfo) != 1
+                || (outputInfo.stateFlags & D2RL::Items::ItemStateIdentified) == 0) {
+                context->LogWarn("A recipe output could not be marked identified; check Inventory for recovery.");
+                return false;
+            }
+
+            NativeOutputTransferState transferState{ .expectedCode = createdItem.code };
+            const auto editResult = ItemService->editNativeItem(context, outputHandle,
+                TransferNativeOutputToAdvancedStash, &transferState);
+            if (editResult != D2RL::Items::Result::Success || !transferState.callbackRan
+                || !transferState.transferAttempted || !transferState.transferred) {
+                char message[224]{};
+                std::snprintf(message, sizeof(message),
+                    "Recipe row %u created output %08X, but not all outputs could be deposited; check Inventory for remaining items.",
+                    recipe.sourceRow, createdItem.code);
+                context->LogWarn(message);
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        context->LogError("Could not finish creating and depositing the recipe outputs; check Inventory for recovery.");
         return false;
     }
-
-    D2RL::Items::ItemInfo outputInfo {
-        .structSize = D2RL::Items::ItemInfoSize,
-    };
-    const auto infoResult = ItemService->getItemInfo(context, outputHandle, &outputInfo);
-    if (infoResult != D2RL::Items::Result::Success
-        || outputInfo.code != recipe.outputs.front()
-        || outputInfo.container != D2RL::Items::ItemContainer::Inventory
-        || outputInfo.inventoryPage != MainInventoryPage) {
-        context->LogWarn("Recipe transaction created an output, but its inventory identity could not be verified for Advanced Stash deposit.");
-        return false;
-    }
-
-    const D2RL::Items::ItemEdit identifyEdit {
-        .structSize = D2RL::Items::ItemEditSize,
-        .fields = D2RL::Items::EditFieldBit(D2RL::Items::EditField::Identified),
-        .stateFlags = D2RL::Items::ItemStateIdentified,
-    };
-    if (ItemService->editItem == nullptr
-        || ItemService->editItem(context, PendingSlotRequest.player, outputHandle, &identifyEdit) != D2RL::Items::Result::Success
-        || ItemService->getItemInfo(context, outputHandle, &outputInfo) != D2RL::Items::Result::Success
-        || (outputInfo.stateFlags & D2RL::Items::ItemStateIdentified) == 0) {
-        context->LogWarn("Recipe output could not be marked identified; it remains in Inventory for recovery.");
-        return false;
-    }
-
-    NativeOutputTransferState transferState{ .expectedCode = recipe.outputs.front() };
-    const auto editResult = ItemService->editNativeItem(context, outputHandle,
-        TransferNativeOutputToAdvancedStash, &transferState);
-    if (editResult != D2RL::Items::Result::Success || !transferState.callbackRan
-        || !transferState.transferAttempted || !transferState.transferred) {
-        char message[224]{};
-        std::snprintf(message, sizeof(message),
-            "Recipe row %u consumed its ingredients and created output %08X, but its Advanced Stash transfer did not complete; the output remains in Inventory.",
-            recipe.sourceRow, recipe.outputs.front());
-        context->LogWarn(message);
-        return false;
-    }
-
-    return true;
 }
 
 void __cdecl PollNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* context, void*) noexcept {
@@ -2113,13 +2174,15 @@ void __cdecl PollNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* contex
             FinishNativeSlotUpgrade();
             return;
         }
-        const bool ingredientsArrived = std::all_of(recipe->inputs.begin(), recipe->inputs.end(), [&](const Ingredient& ingredient) {
+        const bool ingredientsArrived = std::all_of(PendingSlotRequest.transactionIngredients.begin(),
+            PendingSlotRequest.transactionIngredients.end(), [&](const Ingredient& ingredient) {
             return GetAddedStagedQuantity(PendingSlotRequest.stagedItemsBefore, stagedItems.items,
                 stagingContainer, ingredient.code) >= ingredient.quantity;
         });
         if (ingredientsArrived) {
             std::vector<D2RL::Items::TransactionInput> inputs;
-            if (!BuildStagedTransactionInputs(*recipe, PendingSlotRequest.stagedItemsBefore,
+            if (!BuildStagedTransactionInputs(PendingSlotRequest.transactionIngredients,
+                    PendingSlotRequest.stagedItemsBefore,
                     stagedItems.items, stagingContainer, inputs)) {
                 char message[200]{};
                 std::snprintf(message, sizeof(message),
@@ -2129,7 +2192,8 @@ void __cdecl PollNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* contex
                 FinishNativeSlotUpgrade();
                 return;
             }
-            if (CreateRecipeOutputAndDeposit(context, *recipe, inputs)) {
+            if (CreateRecipeItemsAndDeposit(context, *recipe, inputs, PendingSlotRequest.createdItems)
+                && PendingSlotRequest.action == SlotAction::Upgrade) {
                 PlayGemUpgradeSound(context, *recipe);
             }
             FinishNativeSlotUpgrade();
@@ -2164,9 +2228,14 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
     }
     try {
         const Recipe* recipe = FindRecipeByRow(PendingSlotRequest.sourceRow);
-        if (recipe == nullptr || recipe->inputs.empty() || recipe->outputs.size() != 1
-            || recipe->inputs.front().code != PendingSlotRequest.inputCode
-            || recipe->outputs.front() != PendingSlotRequest.outputCode) {
+        const bool recipeMatchesAction = recipe != nullptr && !recipe->inputs.empty()
+            && recipe->outputs.size() == 1
+            && ((PendingSlotRequest.action == SlotAction::Upgrade
+                    && recipe->inputs.front().code == PendingSlotRequest.clickedCode)
+                || (PendingSlotRequest.action == SlotAction::Downgrade
+                    && recipe->outputs.front() == PendingSlotRequest.clickedCode));
+        if (!recipeMatchesAction || PendingSlotRequest.transactionIngredients.empty()
+            || PendingSlotRequest.createdItems.empty()) {
             context->LogWarn("The queued Crafting-slot recipe no longer matches the active one-output recipe list.");
             FinishNativeSlotUpgrade();
             return;
@@ -2193,7 +2262,7 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
             || bytesRead != sizeof(unitFields)
             || unitFields[0] != 4
             || GetNativeUnitId == nullptr || GetNativeUnitId(counterItem) < 0
-            || GetNativeItemCode == nullptr || GetNativeItemCode(counterItem) != PendingSlotRequest.inputCode) {
+            || GetNativeItemCode == nullptr || GetNativeItemCode(counterItem) != PendingSlotRequest.clickedCode) {
             context->LogWarn("The Crafting slot's native item identity did not match the clicked recipe; no items were withdrawn.");
             FinishNativeSlotUpgrade();
             return;
@@ -2229,8 +2298,8 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
         }
 
         std::vector<std::pair<void*, std::uint8_t>> withdrawalItems;
-        withdrawalItems.reserve(recipe->inputs.size());
-        for (const auto& ingredient : recipe->inputs) {
+        withdrawalItems.reserve(PendingSlotRequest.transactionIngredients.size());
+        for (const auto& ingredient : PendingSlotRequest.transactionIngredients) {
             const auto itemClass = ItemClassByCode.find(ingredient.code);
             if (itemClass == ItemClassByCode.end() || ingredient.quantity == 0
                 || ingredient.quantity > std::numeric_limits<std::uint8_t>::max()) {
@@ -2244,7 +2313,7 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
                 FinishNativeSlotUpgrade();
                 return;
             }
-            if (ingredient.code == PendingSlotRequest.inputCode && stashItem != counterItem) {
+            if (ingredient.code == PendingSlotRequest.clickedCode && stashItem != counterItem) {
                 context->LogWarn("The native class lookup did not resolve the clicked rune slot; no items were withdrawn.");
                 FinishNativeSlotUpgrade();
                 return;
@@ -2303,46 +2372,20 @@ void __cdecl BeginNativeSlotUpgradeOnGameThread(const D2RL::PluginContext* conte
     }
 }
 
-auto ResolveCraftingSlotAtInputPoint(std::uintptr_t eventState) noexcept -> bool {
-    if (eventState == 0 || CraftingSlotLayouts.empty()) {
-        return false;
-    }
-    std::array<std::int32_t, 2> coordinates{};
-    SIZE_T bytesRead{};
-    const auto* coordinateAddress = reinterpret_cast<const void*>(eventState + 4);
-    if (!ReadProcessMemory(GetCurrentProcess(), coordinateAddress, coordinates.data(), sizeof(coordinates), &bytesRead)
-        || bytesRead != sizeof(coordinates)) {
-        return false;
-    }
-    const std::int32_t inputX = coordinates[0];
-    const std::int32_t inputY = coordinates[1];
-    if (inputX < 0 || inputY < 0 || inputX > 10000 || inputY > 10000) {
-        return false;
-    }
-
-    const auto pointMatchesSlot = [](std::int32_t pointX, std::int32_t pointY) noexcept -> bool {
-        for (const auto& slot : CraftingSlotLayouts) {
-            if (pointX < slot.x || pointX >= slot.x + slot.width
-                || pointY < slot.y || pointY >= slot.y + slot.height) {
-                continue;
-            }
+auto IsCraftingSlotCode(std::uint32_t itemCode) noexcept -> bool {
+    for (const auto& slot : CraftingSlotLayouts) {
+        if (slot.itemCode.size() == 3
+            && D2RL::Items::MakeItemCode(slot.itemCode[0], slot.itemCode[1], slot.itemCode[2]) == itemCode) {
             return true;
         }
-        return false;
-    };
-
-    // The verified native widget supplies the item's code. Layout geometry only confirms that the click
-    // landed in a dedicated Advanced Stash slot; mods can report coordinates in either scale and may
-    // associate the event point with a neighboring slot rectangle.
-    const bool directMatch = pointMatchesSlot(inputX, inputY);
-    const std::int32_t scaledX = static_cast<std::int32_t>((static_cast<std::int64_t>(inputX) * 3) / 2);
-    const std::int32_t scaledY = static_cast<std::int32_t>((static_cast<std::int64_t>(inputY) * 3) / 2);
-    const bool scaledMatch = pointMatchesSlot(scaledX, scaledY);
-    return directMatch || scaledMatch;
+    }
+    return false;
 }
 
-auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* widget, std::uintptr_t eventState) noexcept -> bool {
+auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* widget,
+    SlotAction action) noexcept -> bool {
     if (context == nullptr || widget == nullptr || ThreadService == nullptr
+        || (action != SlotAction::Upgrade && action != SlotAction::Downgrade)
         || GetAdvancedStashSlotCounterItem == nullptr || GetNativeUnitId == nullptr
         || GetAdvancedStashCounterByte == nullptr || GetNativeItemCode == nullptr
         || RequestAdvancedStashBatchWithdrawal == nullptr || GetLocalDataContext == nullptr
@@ -2364,20 +2407,24 @@ auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* w
         return false;
     }
     const std::uint32_t slotCode = GetNativeItemCode(counterItem);
-    if (!ResolveCraftingSlotAtInputPoint(eventState)) {
+    if (!IsCraftingSlotCode(slotCode)) {
         return false;
     }
     const Recipe* matchedRecipe{};
     for (const auto& recipe : Recipes) {
-        // The first ingredient is the item being upgraded. Other ingredients
-        // (such as the gem cost for a rune upgrade) must not make their slots
-        // appear to have a competing upgrade recipe.
-        if (recipe.inputs.empty() || recipe.outputs.size() != 1
-            || recipe.inputs.front().code != slotCode) {
+        if (recipe.inputs.empty() || recipe.outputs.size() != 1) {
+            continue;
+        }
+        // Upgrade clicks use the recipe's primary input. Downgrade clicks use
+        // its sole output and recreate all of the original inputs.
+        const bool matchesSlot = action == SlotAction::Upgrade
+            ? recipe.inputs.front().code == slotCode
+            : recipe.outputs.front() == slotCode;
+        if (!matchesSlot) {
             continue;
         }
         if (matchedRecipe != nullptr) {
-            context->LogWarn("More than one valid one-output recipe upgrades this Crafting slot; refusing an ambiguous upgrade.");
+            context->LogWarn("More than one valid one-output recipe matches this Crafting slot; refusing an ambiguous operation.");
             return false;
         }
         matchedRecipe = &recipe;
@@ -2385,7 +2432,7 @@ auto TryHandleAdvancedStashSlotClick(const D2RL::PluginContext* context, void* w
     if (matchedRecipe == nullptr) {
         return false;
     }
-    return QueueNativeSlotUpgrade(context, widget, slotCode, *matchedRecipe);
+    return QueueNativeSlotOperation(context, widget, slotCode, *matchedRecipe, action);
 }
 
 auto __fastcall HandleAdvancedStashSlotInput(void* widget, std::uintptr_t eventState) noexcept -> void {
@@ -2486,13 +2533,13 @@ auto InstallStashMaterialIdentificationListener(const D2RL::PluginContext* conte
 
 auto __fastcall ConsumeCurrentInputForUpgrade() noexcept -> void {
     const D2RL::PluginContext* context = LoadContext;
-    if (context != nullptr && ShiftRightClickInputMessageActive && ActiveInputWidget != nullptr) {
+    if (context != nullptr && ActiveSlotAction != SlotAction::None && ActiveInputWidget != nullptr) {
         std::uintptr_t widgetVtable{};
         SIZE_T bytesRead{};
         if (ReadProcessMemory(GetCurrentProcess(), ActiveInputWidget, &widgetVtable, sizeof(widgetVtable), &bytesRead)
             && bytesRead == sizeof(widgetVtable)
             && widgetVtable == MainImageBase + AdvancedStashSlotVtableRva) {
-            (void)TryHandleAdvancedStashSlotClick(context, ActiveInputWidget, ActiveInputPayload);
+            (void)TryHandleAdvancedStashSlotClick(context, ActiveInputWidget, ActiveSlotAction);
         }
     }
 
@@ -2502,38 +2549,108 @@ auto __fastcall ConsumeCurrentInputForUpgrade() noexcept -> void {
     }
 }
 
+auto ModifierKeyBit(std::uint32_t virtualKey, bool altKey) noexcept -> std::uint32_t {
+    if (altKey) {
+        switch (virtualKey) {
+        case VK_MENU: return ModifierGenericKeyBit;
+        case VK_LMENU: return ModifierLeftKeyBit;
+        case VK_RMENU: return ModifierRightKeyBit;
+        default: return 0;
+        }
+    }
+    switch (virtualKey) {
+    case VK_SHIFT: return ModifierGenericKeyBit;
+    case VK_LSHIFT: return ModifierLeftKeyBit;
+    case VK_RSHIFT: return ModifierRightKeyBit;
+    default: return 0;
+    }
+}
+
+auto TrackModifierKeyState(const D2RL::PluginContext*, const D2RL::Input::KeyEvent* event,
+    void*) noexcept -> D2RL::Input::KeyEventResult {
+    if (event == nullptr || event->structSize < D2RL::Input::KeyEventSize
+        || (event->kind != D2RL::Input::KeyEventKind::Down
+            && event->kind != D2RL::Input::KeyEventKind::Up)) {
+        return D2RL::Input::KeyEventResult::Continue;
+    }
+    const std::uint32_t altBit = ModifierKeyBit(event->virtualKey, true);
+    const std::uint32_t shiftBit = ModifierKeyBit(event->virtualKey, false);
+    auto updateState = [event](std::atomic_uint32_t& state, std::uint32_t bit) noexcept {
+        if (bit == 0) {
+            return;
+        }
+        if (event->kind == D2RL::Input::KeyEventKind::Down) {
+            state.fetch_or(bit, std::memory_order_release);
+        } else {
+            state.fetch_and(~bit, std::memory_order_release);
+        }
+    };
+    updateState(AltKeyState, altBit);
+    updateState(ShiftKeyState, shiftBit);
+    return D2RL::Input::KeyEventResult::Continue;
+}
+
+auto InstallModifierKeyListener(const D2RL::PluginContext* context) noexcept -> void {
+    if (context == nullptr) {
+        return;
+    }
+    if (context->QueryService(&InputApiService) != D2RL::ServiceQueryResult::Success
+        || !D2RL::HasInputServiceField(InputApiService, D2RL::InputServiceRegisterKeyListenerFieldEnd)
+        || InputApiService->registerKeyListener == nullptr) {
+        InputApiService = nullptr;
+        context->LogWarn("Modifier key listener is unavailable; using the Windows keyboard-state fallback.");
+        return;
+    }
+
+    const D2RL::Input::KeyListenerRegistration registration {
+        .structSize = D2RL::Input::KeyListenerRegistrationSize,
+        .flags = 0,
+        .callback = TrackModifierKeyState,
+        .userData = nullptr,
+    };
+    if (InputApiService->registerKeyListener(context, &registration, &ModifierKeyListener)
+            != D2RL::Input::Result::Success
+        || ModifierKeyListener == D2RL::Input::InvalidKeyListenerHandle) {
+        ModifierKeyListener = D2RL::Input::InvalidKeyListenerHandle;
+        InputApiService = nullptr;
+        context->LogWarn("Modifier key listener could not be registered; using the Windows keyboard-state fallback.");
+        return;
+    }
+    ModifierKeyListenerActive.store(true, std::memory_order_release);
+}
+
 auto __fastcall BridgeItemWidgetInput(void* widget, const void* message) noexcept -> void {
-    const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool shiftDown{};
+    bool altDown{};
+    if (ModifierKeyListenerActive.load(std::memory_order_acquire)) {
+        shiftDown = ShiftKeyState.load(std::memory_order_acquire) != 0;
+        altDown = AltKeyState.load(std::memory_order_acquire) != 0;
+    } else {
+        shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    }
     std::uint64_t commandHash{};
-    std::uintptr_t payload{};
     SIZE_T bytesRead{};
-    bool isShiftRightClickMessage = false;
-    if (shiftDown && message != nullptr) {
+    SlotAction slotAction{SlotAction::None};
+    if (shiftDown != altDown && message != nullptr) {
         const auto* messageBytes = static_cast<const std::uint8_t*>(message);
         if (ReadProcessMemory(GetCurrentProcess(), messageBytes + 0x88, &commandHash, sizeof(commandHash), &bytesRead)
             && bytesRead == sizeof(commandHash)
             && commandHash == AdvancedStashRightClickCommand) {
-            bytesRead = 0;
-            if (ReadProcessMemory(GetCurrentProcess(), messageBytes + 0x110, &payload, sizeof(payload), &bytesRead)
-                && bytesRead == sizeof(payload)) {
-                isShiftRightClickMessage = true;
-            }
+            slotAction = shiftDown ? SlotAction::Upgrade : SlotAction::Downgrade;
         }
     }
 
-    const bool previousShiftRightClickMessage = ShiftRightClickInputMessageActive;
+    const SlotAction previousSlotAction = ActiveSlotAction;
     void* const previousInputWidget = ActiveInputWidget;
-    const std::uintptr_t previousInputPayload = ActiveInputPayload;
-    ShiftRightClickInputMessageActive = isShiftRightClickMessage;
+    ActiveSlotAction = slotAction;
     ActiveInputWidget = widget;
-    ActiveInputPayload = payload;
     const ItemWidgetInputHandler original = OriginalItemWidgetInputHandler;
     if (original != nullptr) {
         original(widget, message);
     }
-    ShiftRightClickInputMessageActive = previousShiftRightClickMessage;
+    ActiveSlotAction = previousSlotAction;
     ActiveInputWidget = previousInputWidget;
-    ActiveInputPayload = previousInputPayload;
 }
 
 auto InstallItemWidgetInputBridge(const D2RL::PluginContext* context) noexcept -> void {
@@ -2899,9 +3016,13 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         ClearTemporarySpriteCodes();
         AllowWithoutCube = false;
         PendingSlotRequest = PendingSlotUpgrade{};
-        ShiftRightClickInputMessageActive = false;
+        ActiveSlotAction = SlotAction::None;
         ActiveInputWidget = nullptr;
-        ActiveInputPayload = 0;
+        InputApiService = nullptr;
+        ModifierKeyListener = D2RL::Input::InvalidKeyListenerHandle;
+        ModifierKeyListenerActive.store(false, std::memory_order_release);
+        AltKeyState.store(0, std::memory_order_release);
+        ShiftKeyState.store(0, std::memory_order_release);
         OriginalAdvancedStashSlotInputHandler = nullptr;
         OriginalItemWidgetInputHandler = nullptr;
         OriginalCurrentInputConsumer = nullptr;
@@ -2940,6 +3061,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         }
 
         LoadContext = context;
+        InstallModifierKeyListener(context);
         InstallAdvancedStashSlotInputHook(context);
         InstallStashMaterialIdentificationListener(context);
         InstallItemWidgetInputBridge(context);
@@ -2952,6 +3074,16 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
+    const D2RL::PluginContext* const context = LoadContext;
+    if (context != nullptr && InputApiService != nullptr
+        && ModifierKeyListener != D2RL::Input::InvalidKeyListenerHandle
+        && D2RL::HasInputServiceField(InputApiService, D2RL::InputServiceUnregisterKeyListenerFieldEnd)
+        && InputApiService->unregisterKeyListener != nullptr) {
+        (void)InputApiService->unregisterKeyListener(context, ModifierKeyListener);
+    }
+    ModifierKeyListenerActive.store(false, std::memory_order_release);
+    AltKeyState.store(0, std::memory_order_release);
+    ShiftKeyState.store(0, std::memory_order_release);
     LoadContext = nullptr;
     AllowWithoutCube = false;
     OriginalAdvancedStashSlotInputHandler = nullptr;
@@ -2976,6 +3108,8 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     InventoryService = nullptr;
     ItemService = nullptr;
     ThreadService = nullptr;
+    InputApiService = nullptr;
+    ModifierKeyListener = D2RL::Input::InvalidKeyListenerHandle;
     Recipes.clear();
     ItemClassByCode.clear();
     AdvancedStashStackableItemCodes.clear();
