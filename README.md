@@ -39,6 +39,8 @@ When the local player is ready, the plugin marks Normal-quality stackable materi
 
 By default, the plugin requires and uses the Horadric Cube. Set `allow_without_cube = true` to allow Inventory staging when the character has no Cube. If the character has a Cube, it remains the preferred staging container.
 
+The TOML config has separate switches for each action. Set `enable_upgrading = false` to turn off **Shift + right-click** upgrades, or `enable_downgrading = false` to turn off **Alt + right-click** downgrades. Both default to `true`; either action can remain enabled while the other is disabled.
+
 To enable a mod-specific recipe, add its exact `description` text from `cubemain.txt` to the `included-recipes` array. Matching ignores letter case and surrounding spaces. For example:
 
 ```toml

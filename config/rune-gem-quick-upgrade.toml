@@ -2,6 +2,11 @@
 # Set to false to require and use the Horadric Cube.
 allow_without_cube = false
 
+# Set to false to disable Shift + right-click upgrades.
+enable_upgrading = true
+# Set to false to disable Alt + right-click downgrades.
+enable_downgrading = true
+
 # Add exact recipe descriptions from the active mod's cubemain.txt, in quotes
 # and separated by commas. The recipe must be enabled, use simple item-code
 # inputs, and produce exactly one output. Every ingredient and output must

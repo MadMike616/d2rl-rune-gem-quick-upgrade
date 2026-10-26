@@ -78,6 +78,10 @@ constexpr char DefaultConfig[] =
     "# Add exact recipe descriptions from the active mod's cubemain.txt.\n"
     "# Custom recipes require one output and stackable ingredients and output.\n"
     "included-recipes = []\n"
+    "# Set to false to disable Shift + right-click upgrades.\n"
+    "enable_upgrading = true\n"
+    "# Set to false to disable Alt + right-click downgrades.\n"
+    "enable_downgrading = true\n"
     "allow_without_cube = false\n";
 constexpr std::uint64_t AdvancedStashRightClickCommand = 0x02D5172CAC7C938CULL;
 constexpr std::uint64_t InventoryItemRendererRva = 0x2A72D0;
@@ -209,7 +213,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.71",
+    .version     = "0.1.72",
     .author      = "MadMike",
     .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -227,6 +231,8 @@ std::atomic_bool ModifierKeyListenerActive{};
 std::atomic_uint32_t AltKeyState{};
 std::atomic_uint32_t ShiftKeyState{};
 bool AllowWithoutCube{};
+bool EnableUpgrading{true};
+bool EnableDowngrading{true};
 enum class SlotAction : std::uint8_t {
     None,
     Upgrade,
@@ -391,7 +397,11 @@ auto TrimView(std::string_view value) -> std::string_view {
     return value;
 }
 
-auto ReadTomlBoolean(std::string_view config, std::string_view key, bool& value) noexcept -> bool {
+auto ReadTomlBoolean(std::string_view config, std::string_view key, bool& value,
+    bool* found = nullptr) noexcept -> bool {
+    if (found != nullptr) {
+        *found = false;
+    }
     std::size_t start = 0;
     while (start < config.size()) {
         const std::size_t end = config.find('\n', start);
@@ -404,6 +414,9 @@ auto ReadTomlBoolean(std::string_view config, std::string_view key, bool& value)
         line = TrimView(line);
         const std::size_t equals = line.find('=');
         if (equals != std::string_view::npos && TrimView(line.substr(0, equals)) == key) {
+            if (found != nullptr) {
+                *found = true;
+            }
             const std::string_view configuredValue = TrimView(line.substr(equals + 1));
             if (configuredValue == "true") {
                 value = true;
@@ -533,6 +546,8 @@ auto ReadTomlStringArray(std::string_view config, std::string_view key,
 
 auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
     AllowWithoutCube = false;
+    EnableUpgrading = true;
+    EnableDowngrading = true;
     IncludedRecipeNames.clear();
     if (context == nullptr || !context->EnsureConfig(DefaultConfig)) {
         if (context != nullptr) {
@@ -555,6 +570,18 @@ auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
             AllowWithoutCube = configuredValue;
         } else {
             context->LogWarn("The plugin TOML config has no valid allow_without_cube boolean; Cube staging remains required.");
+        }
+        bool settingFound{};
+        if (ReadTomlBoolean(config, "enable_upgrading", configuredValue, &settingFound)) {
+            EnableUpgrading = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML enable_upgrading setting is invalid; upgrading remains enabled.");
+        }
+        settingFound = false;
+        if (ReadTomlBoolean(config, "enable_downgrading", configuredValue, &settingFound)) {
+            EnableDowngrading = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML enable_downgrading setting is invalid; downgrading remains enabled.");
         }
         std::vector<std::string> includedRecipes;
         bool includedRecipesFound{};
@@ -2633,11 +2660,15 @@ auto __fastcall BridgeItemWidgetInput(void* widget, const void* message) noexcep
     SIZE_T bytesRead{};
     SlotAction slotAction{SlotAction::None};
     if (shiftDown != altDown && message != nullptr) {
+        const SlotAction requestedAction = shiftDown ? SlotAction::Upgrade : SlotAction::Downgrade;
+        const bool requestedActionEnabled = requestedAction == SlotAction::Upgrade
+            ? EnableUpgrading : EnableDowngrading;
         const auto* messageBytes = static_cast<const std::uint8_t*>(message);
-        if (ReadProcessMemory(GetCurrentProcess(), messageBytes + 0x88, &commandHash, sizeof(commandHash), &bytesRead)
+        if (requestedActionEnabled
+            && ReadProcessMemory(GetCurrentProcess(), messageBytes + 0x88, &commandHash, sizeof(commandHash), &bytesRead)
             && bytesRead == sizeof(commandHash)
             && commandHash == AdvancedStashRightClickCommand) {
-            slotAction = shiftDown ? SlotAction::Upgrade : SlotAction::Downgrade;
+            slotAction = requestedAction;
         }
     }
 
@@ -3086,6 +3117,8 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     ShiftKeyState.store(0, std::memory_order_release);
     LoadContext = nullptr;
     AllowWithoutCube = false;
+    EnableUpgrading = true;
+    EnableDowngrading = true;
     OriginalAdvancedStashSlotInputHandler = nullptr;
     OriginalItemWidgetInputHandler = nullptr;
     OriginalCurrentInputConsumer = nullptr;
