@@ -7,6 +7,19 @@ enable_upgrading = true
 # Set to false to disable Alt + right-click downgrades.
 enable_downgrading = true
 
+# Remove the gem ingredient from rune upgrade recipes. This only changes the
+# recipe used by the plugin; it does not edit cubemain.txt.
+remove_gem_requirements = false
+
+# Force all supported rune upgrades to use this many lower-rank runes.
+# These two options are mutually exclusive. If both are true, both are ignored.
+use_two_runes_for_all_upgrades = false
+use_three_runes_for_all_upgrades = false
+
+# When enabled, rune downgrades return one fewer rune than the effective
+# upgrade cost, with a minimum output of one rune.
+downgrade_returns_one_less_rune = false
+
 # Add exact recipe descriptions from the active mod's cubemain.txt, in quotes
 # and separated by commas. The recipe must be enabled, use simple item-code
 # inputs, and produce exactly one output. Every ingredient and output must

@@ -82,6 +82,16 @@ constexpr char DefaultConfig[] =
     "enable_upgrading = true\n"
     "# Set to false to disable Alt + right-click downgrades.\n"
     "enable_downgrading = true\n"
+    "# Remove gem ingredients from supported rune upgrade recipes in memory.\n"
+    "remove_gem_requirements = false\n"
+    "# Force supported rune recipes to consume 2 runes per upgrade.\n"
+    "# Mutually exclusive with use_three_runes_for_all_upgrades.\n"
+    "use_two_runes_for_all_upgrades = false\n"
+    "# Force supported rune recipes to consume 3 runes per upgrade.\n"
+    "# Mutually exclusive with use_two_runes_for_all_upgrades.\n"
+    "use_three_runes_for_all_upgrades = false\n"
+    "# When enabled, rune downgrades return one fewer rune than the effective upgrade cost (minimum 1).\n"
+    "downgrade_returns_one_less_rune = false\n"
     "allow_without_cube = false\n";
 constexpr std::uint64_t AdvancedStashRightClickCommand = 0x02D5172CAC7C938CULL;
 constexpr std::uint64_t InventoryItemRendererRva = 0x2A72D0;
@@ -213,7 +223,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.72",
+    .version     = "0.1.74",
     .author      = "MadMike",
     .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -233,6 +243,10 @@ std::atomic_uint32_t ShiftKeyState{};
 bool AllowWithoutCube{};
 bool EnableUpgrading{true};
 bool EnableDowngrading{true};
+bool RemoveGemRequirements{};
+bool UseTwoRunesForAllUpgrades{};
+bool UseThreeRunesForAllUpgrades{};
+bool DowngradeReturnsOneLessRune{};
 enum class SlotAction : std::uint8_t {
     None,
     Upgrade,
@@ -548,6 +562,10 @@ auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
     AllowWithoutCube = false;
     EnableUpgrading = true;
     EnableDowngrading = true;
+    RemoveGemRequirements = false;
+    UseTwoRunesForAllUpgrades = false;
+    UseThreeRunesForAllUpgrades = false;
+    DowngradeReturnsOneLessRune = false;
     IncludedRecipeNames.clear();
     if (context == nullptr || !context->EnsureConfig(DefaultConfig)) {
         if (context != nullptr) {
@@ -582,6 +600,35 @@ auto LoadPluginConfig(const D2RL::PluginContext* context) noexcept -> void {
             EnableDowngrading = configuredValue;
         } else if (settingFound) {
             context->LogWarn("The plugin TOML enable_downgrading setting is invalid; downgrading remains enabled.");
+        }
+        settingFound = false;
+        if (ReadTomlBoolean(config, "remove_gem_requirements", configuredValue, &settingFound)) {
+            RemoveGemRequirements = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML remove_gem_requirements setting is invalid; gem requirements remain enabled.");
+        }
+        settingFound = false;
+        if (ReadTomlBoolean(config, "use_two_runes_for_all_upgrades", configuredValue, &settingFound)) {
+            UseTwoRunesForAllUpgrades = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML use_two_runes_for_all_upgrades setting is invalid; the setting is ignored.");
+        }
+        settingFound = false;
+        if (ReadTomlBoolean(config, "use_three_runes_for_all_upgrades", configuredValue, &settingFound)) {
+            UseThreeRunesForAllUpgrades = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML use_three_runes_for_all_upgrades setting is invalid; the setting is ignored.");
+        }
+        settingFound = false;
+        if (ReadTomlBoolean(config, "downgrade_returns_one_less_rune", configuredValue, &settingFound)) {
+            DowngradeReturnsOneLessRune = configuredValue;
+        } else if (settingFound) {
+            context->LogWarn("The plugin TOML downgrade_returns_one_less_rune setting is invalid; the setting is ignored.");
+        }
+        if (UseTwoRunesForAllUpgrades && UseThreeRunesForAllUpgrades) {
+            context->LogWarn("The TOML rune ratio settings are mutually exclusive; both overrides are ignored and the active recipe ratios are used.");
+            UseTwoRunesForAllUpgrades = false;
+            UseThreeRunesForAllUpgrades = false;
         }
         std::vector<std::string> includedRecipes;
         bool includedRecipesFound{};
@@ -1441,6 +1488,69 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
             continue;
         }
 
+        // Apply rune-only overrides to the in-memory recipe model. The active
+        // CubeMain table is read-only: neither its input fields nor its text file
+        // are changed by these settings.
+        if (recipe.outputs.size() == 1) {
+            const auto outputProgression = progressionByCode.find(recipe.outputs.front());
+            if (outputProgression != progressionByCode.end()
+                && outputProgression->second.kind == UpgradeKind::Rune) {
+                std::size_t runeInputCount{};
+                std::size_t gemInputCount{};
+                bool allInputsAreRuneOrGem = true;
+                auto runeInput = recipe.inputs.end();
+                for (auto input = recipe.inputs.begin(); input != recipe.inputs.end(); ++input) {
+                    const auto inputProgression = progressionByCode.find(input->code);
+                    if (inputProgression == progressionByCode.end()) {
+                        allInputsAreRuneOrGem = false;
+                        break;
+                    }
+                    if (inputProgression->second.kind == UpgradeKind::Rune) {
+                        ++runeInputCount;
+                        runeInput = input;
+                    } else {
+                        ++gemInputCount;
+                        if (input->quantity != 1) {
+                            allInputsAreRuneOrGem = false;
+                            break;
+                        }
+                    }
+                }
+                if (allInputsAreRuneOrGem && runeInputCount == 1 && gemInputCount <= 1
+                    && runeInput != recipe.inputs.end()
+                    && (runeInput->quantity == 2 || runeInput->quantity == 3)
+                    && recipe.totalInputQuantity == runeInput->quantity + gemInputCount) {
+                    const auto runeProgression = progressionByCode.find(runeInput->code);
+                    const bool isNextRankRuneRecipe = runeProgression != progressionByCode.end()
+                        && runeProgression->second.kind == UpgradeKind::Rune
+                        && outputProgression->second.rank == runeProgression->second.rank + 1;
+                    if (isNextRankRuneRecipe) {
+                        const std::uint32_t runeCode = runeInput->code;
+                        if (RemoveGemRequirements && gemInputCount != 0) {
+                            std::erase_if(recipe.inputs, [&](const Ingredient& ingredient) {
+                                const auto progression = progressionByCode.find(ingredient.code);
+                                return progression != progressionByCode.end()
+                                    && progression->second.kind == UpgradeKind::Gem;
+                            });
+                        }
+                        const auto adjustedRuneInput = std::find_if(recipe.inputs.begin(), recipe.inputs.end(),
+                            [&](const Ingredient& ingredient) { return ingredient.code == runeCode; });
+                        if (adjustedRuneInput != recipe.inputs.end()) {
+                            if (UseTwoRunesForAllUpgrades) {
+                                adjustedRuneInput->quantity = 2;
+                            } else if (UseThreeRunesForAllUpgrades) {
+                                adjustedRuneInput->quantity = 3;
+                            }
+                        }
+                        recipe.totalInputQuantity = 0;
+                        for (const auto& ingredient : recipe.inputs) {
+                            recipe.totalInputQuantity += ingredient.quantity;
+                        }
+                    }
+                }
+            }
+        }
+
         // A TOML entry opts this enabled CubeMain row into the generic path
         // only when every affected item is a validated, dedicated-slot item.
         if (includedByConfig) {
@@ -1508,8 +1618,9 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
             const auto inputProgression = runeInput != nullptr
                 ? progressionByCode.find(runeInput->code) : progressionByCode.end();
             const bool plainRuneUpgrade = recipe.inputs.size() == 1 && runeInputCount == 1
-                && gemInputCount == 0 && runeInput != nullptr && runeInput->quantity == 3
-                && recipe.totalInputQuantity == 3;
+                && gemInputCount == 0 && runeInput != nullptr
+                && (runeInput->quantity == 2 || runeInput->quantity == 3)
+                && recipe.totalInputQuantity == runeInput->quantity;
             const bool gemCostRuneUpgrade = recipe.inputs.size() == 2 && runeInputCount == 1
                 && gemInputCount == 1 && runeInput != nullptr && gemInput != nullptr
                 && (runeInput->quantity == 2 || runeInput->quantity == 3)
@@ -1889,6 +2000,20 @@ auto QueueNativeSlotOperation(const D2RL::PluginContext* context, void* widget, 
         if (action == SlotAction::Downgrade) {
             PendingSlotRequest.transactionIngredients.push_back({ recipe.outputs.front(), 1 });
             PendingSlotRequest.createdItems = recipe.inputs;
+            if (DowngradeReturnsOneLessRune && RuneItemCodes.contains(recipe.outputs.front())) {
+                auto runeInput = PendingSlotRequest.createdItems.end();
+                std::size_t runeInputCount{};
+                for (auto input = PendingSlotRequest.createdItems.begin();
+                    input != PendingSlotRequest.createdItems.end(); ++input) {
+                    if (RuneItemCodes.contains(input->code)) {
+                        runeInput = input;
+                        ++runeInputCount;
+                    }
+                }
+                if (runeInputCount == 1 && runeInput != PendingSlotRequest.createdItems.end()) {
+                    runeInput->quantity = runeInput->quantity > 1 ? runeInput->quantity - 1 : 1;
+                }
+            }
         } else {
             PendingSlotRequest.transactionIngredients = recipe.inputs;
             PendingSlotRequest.createdItems.reserve(recipe.outputs.size());
@@ -3046,6 +3171,9 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         HideTemporaryInventoryWidgets.store(false, std::memory_order_release);
         ClearTemporarySpriteCodes();
         AllowWithoutCube = false;
+        RemoveGemRequirements = false;
+        UseTwoRunesForAllUpgrades = false;
+        UseThreeRunesForAllUpgrades = false;
         PendingSlotRequest = PendingSlotUpgrade{};
         ActiveSlotAction = SlotAction::None;
         ActiveInputWidget = nullptr;
@@ -3119,6 +3247,10 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     AllowWithoutCube = false;
     EnableUpgrading = true;
     EnableDowngrading = true;
+    RemoveGemRequirements = false;
+    UseTwoRunesForAllUpgrades = false;
+    UseThreeRunesForAllUpgrades = false;
+    DowngradeReturnsOneLessRune = false;
     OriginalAdvancedStashSlotInputHandler = nullptr;
     OriginalItemWidgetInputHandler = nullptr;
     OriginalCurrentInputConsumer = nullptr;

@@ -12,12 +12,12 @@ The plugin handles materials in dedicated Advanced Stash slots. It does not act 
 The plugin reads the active mod's `cubemain.txt` and accepts enabled recipes that match these forms:
 
 - Three identical gems into one gem of the next rank.
-- Three identical runes into one rune of the next rank.
-- A next-rank rune recipe that also requires one specified gem.
+- Two or three identical runes into one rune of the next rank, following the active mod's `cubemain.txt` recipe unless changed by the TOML settings below.
+- A next-rank rune recipe that also requires one specified gem, unless gem requirements are disabled in the TOML settings.
 - Three Rejuvenation Potions (`rvs`) into one Full Rejuvenation Potion (`rvl`).
 - Additional mod recipes listed in `included-recipes` in the plugin's TOML config.
 
-For an upgrade, click the recipe's primary input slot. Secondary ingredients, such as a gem required for a rune recipe, are withdrawn automatically. For a downgrade, click the recipe's output slot. The plugin recreates all recipe inputs at their specified quantities, including a gem cost when present. If more than one enabled one-output recipe produces that item, it refuses to choose between them.
+For an upgrade, click the recipe's primary input slot. Secondary ingredients, such as a gem required for a rune recipe, are withdrawn automatically. For a downgrade, click the recipe's output slot. By default, the plugin recreates the recipe inputs at their effective quantities, including a gem cost when present. If `downgrade_returns_one_less_rune` is enabled, it returns one fewer rune (minimum one) while keeping any other inputs at their effective quantities. If more than one enabled one-output recipe produces that item, it refuses to choose between them.
 
 Custom recipes must be enabled in `cubemain.txt`, use simple item-code inputs, and produce exactly one item. Every input and output must exist in `misc.txt`, `armor.txt`, or `weapons.txt` with `AdvancedStashStackable` set to `1`; each item's type must exist in `itemtypes.txt`. The plugin reads these tables from the active mod and uses D2RLoader's compiled tables for missing files. Recipes with unsupported conditions are ignored. The potion recipe is included only when the active tables define it.
 
@@ -38,6 +38,15 @@ When the local player is ready, the plugin marks Normal-quality stackable materi
 3. Open an Advanced Stash material tab and use **Shift + right-click** on a recipe input to upgrade or **Alt + right-click** on its output to downgrade.
 
 By default, the plugin requires and uses the Horadric Cube. Set `allow_without_cube = true` to allow Inventory staging when the character has no Cube. If the character has a Cube, it remains the preferred staging container.
+
+The rune recipe settings below affect only the plugin's in-memory recipe data. They never edit `cubemain.txt`:
+
+- Set `remove_gem_requirements = true` to omit gem ingredients from supported rune upgrades. Downgrading does not recreate gems omitted from the effective recipe.
+- Set `use_two_runes_for_all_upgrades = true` to make every supported rune upgrade consume two lower-rank runes. By default, the corresponding downgrade returns two.
+- Set `use_three_runes_for_all_upgrades = true` to make every supported rune upgrade consume three lower-rank runes. By default, the corresponding downgrade returns three.
+- Set `downgrade_returns_one_less_rune = true` to make each rune downgrade return one fewer lower-rank rune than its effective upgrade cost, with a minimum of one. For example, three-rune upgrades downgrade into two runes; two-rune upgrades downgrade into one. This also applies when the two- or three-rune override is enabled.
+
+The two upgrade rune-count settings are mutually exclusive. If both are `true`, the plugin logs a warning and uses the active mod's original rune counts. All four recipe settings default to `false`.
 
 The TOML config has separate switches for each action. Set `enable_upgrading = false` to turn off **Shift + right-click** upgrades, or `enable_downgrading = false` to turn off **Alt + right-click** downgrades. Both default to `true`; either action can remain enabled while the other is disabled.
 
