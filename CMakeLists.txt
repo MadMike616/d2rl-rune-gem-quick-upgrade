@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(RuneGemQuickUpgrade VERSION 0.1.74 LANGUAGES CXX RC)
+project(RuneGemQuickUpgrade VERSION 0.1.75 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,3 +43,4 @@ if(MSVC)
     target_compile_options(rune_gem_quick_upgrade PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(rune_gem_quick_upgrade PRIVATE /INCREMENTAL:NO /Brepro)
 endif()
+

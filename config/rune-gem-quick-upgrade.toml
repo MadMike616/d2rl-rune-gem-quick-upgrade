@@ -28,3 +28,4 @@ downgrade_returns_one_less_rune = false
 # Example, only if the mod defines these exact descriptions:
 # included-recipes = ["2 Corrupted Orb -> Exalted Orb", "2 Exalted Orbs -> Divine Orb"]
 included-recipes = []
+

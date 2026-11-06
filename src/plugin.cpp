@@ -223,7 +223,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.74",
+    .version     = "0.1.75",
     .author      = "MadMike",
     .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -240,6 +240,7 @@ std::atomic_bool HideTemporaryInventoryWidgets{};
 std::atomic_bool ModifierKeyListenerActive{};
 std::atomic_uint32_t AltKeyState{};
 std::atomic_uint32_t ShiftKeyState{};
+std::atomic_uint32_t ControlKeyState{};
 bool AllowWithoutCube{};
 bool EnableUpgrading{true};
 bool EnableDowngrading{true};
@@ -2701,12 +2702,26 @@ auto __fastcall ConsumeCurrentInputForUpgrade() noexcept -> void {
     }
 }
 
-auto ModifierKeyBit(std::uint32_t virtualKey, bool altKey) noexcept -> std::uint32_t {
-    if (altKey) {
+enum class TrackedModifier : std::uint8_t {
+    Alt,
+    Shift,
+    Control,
+};
+
+auto ModifierKeyBit(std::uint32_t virtualKey, TrackedModifier modifier) noexcept -> std::uint32_t {
+    if (modifier == TrackedModifier::Alt) {
         switch (virtualKey) {
         case VK_MENU: return ModifierGenericKeyBit;
         case VK_LMENU: return ModifierLeftKeyBit;
         case VK_RMENU: return ModifierRightKeyBit;
+        default: return 0;
+        }
+    }
+    if (modifier == TrackedModifier::Control) {
+        switch (virtualKey) {
+        case VK_CONTROL: return ModifierGenericKeyBit;
+        case VK_LCONTROL: return ModifierLeftKeyBit;
+        case VK_RCONTROL: return ModifierRightKeyBit;
         default: return 0;
         }
     }
@@ -2725,8 +2740,9 @@ auto TrackModifierKeyState(const D2RL::PluginContext*, const D2RL::Input::KeyEve
             && event->kind != D2RL::Input::KeyEventKind::Up)) {
         return D2RL::Input::KeyEventResult::Continue;
     }
-    const std::uint32_t altBit = ModifierKeyBit(event->virtualKey, true);
-    const std::uint32_t shiftBit = ModifierKeyBit(event->virtualKey, false);
+    const std::uint32_t altBit = ModifierKeyBit(event->virtualKey, TrackedModifier::Alt);
+    const std::uint32_t shiftBit = ModifierKeyBit(event->virtualKey, TrackedModifier::Shift);
+    const std::uint32_t controlBit = ModifierKeyBit(event->virtualKey, TrackedModifier::Control);
     auto updateState = [event](std::atomic_uint32_t& state, std::uint32_t bit) noexcept {
         if (bit == 0) {
             return;
@@ -2739,6 +2755,7 @@ auto TrackModifierKeyState(const D2RL::PluginContext*, const D2RL::Input::KeyEve
     };
     updateState(AltKeyState, altBit);
     updateState(ShiftKeyState, shiftBit);
+    updateState(ControlKeyState, controlBit);
     return D2RL::Input::KeyEventResult::Continue;
 }
 
@@ -2774,17 +2791,22 @@ auto InstallModifierKeyListener(const D2RL::PluginContext* context) noexcept -> 
 auto __fastcall BridgeItemWidgetInput(void* widget, const void* message) noexcept -> void {
     bool shiftDown{};
     bool altDown{};
+    bool controlDown{};
     if (ModifierKeyListenerActive.load(std::memory_order_acquire)) {
         shiftDown = ShiftKeyState.load(std::memory_order_acquire) != 0;
         altDown = AltKeyState.load(std::memory_order_acquire) != 0;
+        controlDown = ControlKeyState.load(std::memory_order_acquire) != 0;
     } else {
         shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     }
+    // Ctrl+Shift is reserved by D2RLoader for moving items to the cube.
+    // Keep that gesture on the game's normal input path without running a recipe.
+    controlDown = controlDown || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     std::uint64_t commandHash{};
     SIZE_T bytesRead{};
     SlotAction slotAction{SlotAction::None};
-    if (shiftDown != altDown && message != nullptr) {
+    if (!controlDown && shiftDown != altDown && message != nullptr) {
         const SlotAction requestedAction = shiftDown ? SlotAction::Upgrade : SlotAction::Downgrade;
         const bool requestedActionEnabled = requestedAction == SlotAction::Upgrade
             ? EnableUpgrading : EnableDowngrading;
@@ -3182,6 +3204,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         ModifierKeyListenerActive.store(false, std::memory_order_release);
         AltKeyState.store(0, std::memory_order_release);
         ShiftKeyState.store(0, std::memory_order_release);
+        ControlKeyState.store(0, std::memory_order_release);
         OriginalAdvancedStashSlotInputHandler = nullptr;
         OriginalItemWidgetInputHandler = nullptr;
         OriginalCurrentInputConsumer = nullptr;
@@ -3243,6 +3266,7 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     ModifierKeyListenerActive.store(false, std::memory_order_release);
     AltKeyState.store(0, std::memory_order_release);
     ShiftKeyState.store(0, std::memory_order_release);
+    ControlKeyState.store(0, std::memory_order_release);
     LoadContext = nullptr;
     AllowWithoutCube = false;
     EnableUpgrading = true;

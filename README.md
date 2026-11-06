@@ -4,6 +4,7 @@ Rune Gem Quick Upgrade adds upgrade and downgrade shortcuts for supported materi
 
 - Hold **Shift** and right-click a recipe's primary input slot to upgrade it.
 - Hold **Alt** and right-click a recipe's output slot to reverse that recipe.
+- If **Ctrl** is also held, the plugin leaves the input to the game's Ctrl+Shift item-move binding.
 
 The plugin handles materials in dedicated Advanced Stash slots. It does not act on items in the Personal or Shared tabs.
 
@@ -72,3 +73,4 @@ CMake fetches the pinned D2RLoader PluginSDK revision. To build without fetching
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
