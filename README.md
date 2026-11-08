@@ -68,6 +68,8 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+Use the `Release` configuration for distributable plugin builds.
+
 CMake fetches the pinned D2RLoader PluginSDK revision. To build without fetching it, set `RUNE_GEM_QUICK_UPGRADE_LOCAL_SDK_DIR` to a local PluginSDK checkout. The DLL is written to the build directory.
 
 ## License

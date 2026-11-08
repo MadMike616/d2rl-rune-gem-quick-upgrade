@@ -1,39 +1,41 @@
-# Hook Inventory
+# Hook Inventory — Rune Gem Quick Upgrade
 
-Release: v0.1.75  
-Release date: 2026-11-07  
-Plugin binary: `d2rl-rune-gem-quick-upgrade.dll`  
-File version: `0.1.75.0`
+## Plugin metadata
 
-## Native inline hooks
+| Field | Value |
+|---|---|
+| Plugin name | Rune Gem Quick Upgrade |
+| Plugin ID | rune-gem-quick-upgrade |
+| Release version | 0.1.76 |
+| Inventory updated | 2026-11-08 |
+| Source revision | Tag v0.1.76 |
+| D2R build(s) audited | Not validated |
+| D2RLoader SDK / Plugin ABI | SDK 0.4.0 / Plugin ABI 4 |
+| Audit status | Complete |
 
-All addresses below are RVAs from the D2R main image. The plugin validates expected bytes before installing each hook and skips the affected path when a fingerprint does not match.
+## Scope and method
 
-| RVA | Target | Purpose |
-| --- | --- | --- |
-| `0x2CF760` | Advanced Stash slot input handler | Detect Shift/Alt right-clicks on dedicated material slots and run the selected recipe. |
-| `0x2A98B0` | Item widget input dispatcher | Track the modifier gesture; Ctrl suppresses recipe handling so Ctrl+Shift remains available for the game's move-to-Cube action. |
-| `0x843FC0` | `UI_ConsumeCurrentInput` | Handle the selected stash-slot action after the widget hit test. |
-| `0x2A72D0` | Inventory item renderer | Hide temporary ingredient and output sprites during crafting. |
-| `0x2C3390` | Inventory item widget draw | Suppress temporary item-cell flashes during crafting. |
-| `0x2A7170` | Inventory slot widget draw | Suppress temporary slot-cell flashes during crafting. |
+Inspected `src/plugin.cpp`, `src/plugin.rc`, `CMakeLists.txt`, and `README.md` in the v0.1.76 release source. Searched for every `InstallInlineHook` call and reviewed its target, expected-byte guard, and related widget checks. The plugin installs six inline hooks. The inventory is source-level; no live game build was validated. No hook-site changes were made from v0.1.75.
 
-## Vtable validation targets
+## Hook sites
 
-The plugin reads these vtable entries to validate the UI structures. It does not write or replace vtable entries.
+| Site ID | Type | Target | Address / identifier | Operation | Guard / validation | Source reference | Notes |
+|---|---|---|---|---|---|---|---|
+| H-01 | Inline | Advanced Stash slot input handler | RVA 0x2CF760 | Installs a handler for recipe gestures on material slots | Expected function bytes and Advanced Stash vtable entries are validated | `src/plugin.cpp` — `InstallAdvancedStashSlotInputHook` | Hook is installed only when the validated Advanced Stash path is available. |
+| H-02 | Inline | Item widget input dispatcher | RVA 0x2A98B0 | Tracks modifier state and filters recipe input | Expected function bytes are checked before installation | `src/plugin.cpp` — `InstallItemWidgetInputBridge` | Ctrl suppresses crafting so Ctrl+Shift remains available to the game's move-to-Cube gesture. |
+| H-03 | Inline | UI_ConsumeCurrentInput | RVA 0x843FC0 | Handles the selected stash-slot action after hit testing | Expected function bytes are checked before installation | `src/plugin.cpp` — `InstallConsumeCurrentInputHook` | Input dispatch path. |
+| H-04 | Inline | Inventory item renderer | RVA 0x2A72D0 | Hides temporary ingredient and output sprites during crafting | Expected function bytes are checked before installation | `src/plugin.cpp` — `InstallTemporarySpriteRendererHook` | Temporary sprite suppression. |
+| H-05 | Inline | Inventory item widget draw | RVA 0x2C3390 | Suppresses temporary item-cell flashes | Expected function bytes and the widget vtable entry are validated | `src/plugin.cpp` — `InstallTemporaryInventoryWidgetDrawHook` | Vtable entry is checked, not replaced. |
+| H-06 | Inline | Inventory slot widget draw | RVA 0x2A7170 | Suppresses temporary slot-cell flashes | Expected function bytes and the widget vtable entry are validated | `src/plugin.cpp` — `InstallTemporaryInventorySlotWidgetDrawHook` | Vtable entry is checked, not replaced. |
 
-| Vtable RVA | Entry offset | Expected target | Purpose |
-| --- | --- | --- | --- |
-| `0x1CF4678` | `+0xC8` | `0x2CE900` | Advanced Stash slot counter getter. |
-| `0x1CF4678` | `+0x100` | `0x2CF760` | Advanced Stash slot input handler. |
-| `0x1CF3800` | `+0xF0` | `0x2C3390` | Inventory item widget draw method. |
-| `0x1CF3F20` | `+0xF0` | `0x2A7170` | Inventory slot widget draw method. |
+## Known collision overlaps
 
-## Input listener
+None identified in the current inventory; this is not a compatibility guarantee.
 
-Modifier state is tracked through D2RLoader's SDK input key-listener service for Shift, Alt, and Control. If that service cannot register, the plugin falls back to Windows keyboard-state reads. The plugin does not install a separate OS-level keyboard hook.
+| Other plugin | Shared target | Relationship | Evidence / notes |
+|---|---|---|---|
 
-## Release change and collision note
+## Audit notes
 
-Compared with v0.1.74, v0.1.75 changes the item-input dispatch guard to ignore recipe gestures while Control is held. This preserves Ctrl+Shift item movement and Alt/Shift recipe gestures. No inline hook RVA, patch site, or vtable target changed in this release.
+The plugin reads Advanced Stash and inventory vtable entries to confirm widget types but does not replace those entries. Modifier listeners use D2RLoader's input service with a keyboard-state fallback; no operating-system input hook is installed. No game build was validated. The v0.1.76 Release rebuild changes optimization and file-version metadata only; native hook sites are unchanged from v0.1.75.
 
