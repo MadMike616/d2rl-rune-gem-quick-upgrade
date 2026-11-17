@@ -6,16 +6,16 @@
 |---|---|
 | Plugin name | Rune Gem Quick Upgrade |
 | Plugin ID | rune-gem-quick-upgrade |
-| Release version | 0.1.76 |
-| Inventory updated | 2026-11-08 |
-| Source revision | Tag v0.1.76 |
+| Release version | 1.1.76 |
+| Inventory updated | 2026-11-17 |
+| Source revision | Tag v1.1.76 |
 | D2R build(s) audited | Not validated |
 | D2RLoader SDK / Plugin ABI | SDK 0.4.0 / Plugin ABI 4 |
 | Audit status | Complete |
 
 ## Scope and method
 
-Inspected `src/plugin.cpp`, `src/plugin.rc`, `CMakeLists.txt`, and `README.md` in the v0.1.76 release source. Searched for every `InstallInlineHook` call and reviewed its target, expected-byte guard, and related widget checks. The plugin installs six inline hooks. The inventory is source-level; no live game build was validated. No hook-site changes were made from v0.1.75.
+Inspected `src/plugin.cpp`, `src/plugin.rc`, `CMakeLists.txt`, and `README.md` in the v1.1.76 release source. Searched for every `InstallInlineHook` call and reviewed its target, expected-byte guard, and related widget checks. The plugin installs six inline hooks. The inventory is source-level; no live game build was validated. No hook-site changes were made from v0.1.76.
 
 ## Hook sites
 
@@ -37,5 +37,4 @@ None identified in the current inventory; this is not a compatibility guarantee.
 
 ## Audit notes
 
-The plugin reads Advanced Stash and inventory vtable entries to confirm widget types but does not replace those entries. Modifier listeners use D2RLoader's input service with a keyboard-state fallback; no operating-system input hook is installed. No game build was validated. The v0.1.76 Release rebuild changes optimization and file-version metadata only; native hook sites are unchanged from v0.1.75.
-
+The plugin reads Advanced Stash and inventory vtable entries to confirm widget types but does not replace those entries. Modifier listeners use D2RLoader's input service with a keyboard-state fallback; no operating-system input hook is installed. No game build was validated. The first launch installer uses a named Windows mutex to serialize table copies. It does not install an input or message hook. The existing identified flag write updates a live item instance rather than game code or a shared slot.
