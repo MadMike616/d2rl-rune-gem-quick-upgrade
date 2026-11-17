@@ -20,7 +20,7 @@ The plugin reads the active mod's `cubemain.txt` and accepts enabled recipes tha
 
 For an upgrade, click the recipe's primary input slot. Secondary ingredients, such as a gem required for a rune recipe, are withdrawn automatically. For a downgrade, click the recipe's output slot. By default, the plugin recreates the recipe inputs at their effective quantities, including a gem cost when present. If `downgrade_returns_one_less_rune` is enabled, it returns one fewer rune (minimum one) while keeping any other inputs at their effective quantities. If more than one enabled one-output recipe produces that item, it refuses to choose between them.
 
-Custom recipes must be enabled in `cubemain.txt`, use simple item-code inputs, and produce exactly one item. Every input and output must exist in `misc.txt`, `armor.txt`, or `weapons.txt` with `AdvancedStashStackable` set to `1`; each item's type must exist in `itemtypes.txt`. The plugin reads these tables from the active mod and uses D2RLoader's compiled tables for missing files. Recipes with unsupported conditions are ignored. The potion recipe is included only when the active tables define it.
+Custom recipes must be enabled in `cubemain.txt`, use simple item-code inputs, and produce exactly one item. Every input and output must exist in `misc.txt`, `armor.txt`, or `weapons.txt` with `AdvancedStashStackable` set to `1`; each item's type must exist in `itemtypes.txt`. See [Optional base files](#optional-base-files) for table lookup and setup. Recipes with unsupported conditions are ignored. The potion recipe is included only when the active tables define it.
 
 When the local player is ready, the plugin marks Normal-quality stackable materials in the Advanced Stash as identified. This keeps their tooltips correct on the first hover after entering a game.
 
@@ -59,6 +59,14 @@ included-recipes = ["2 Corrupted Orb -> Exalted Orb", "2 Exalted Orbs -> Divine 
 
 Every ingredient and output must be marked `AdvancedStashStackable = 1` in the active item tables. These strings only select recipes already defined by the mod; they do not create or alter CubeMain recipes.
 
+### Optional base files
+
+The plugin needs five game tables: `cubemain.txt`, `misc.txt`, `itemtypes.txt`, `armor.txt`, and `weapons.txt`. It reads each table from the mod's loose `data/global/excel/` folder first. Starting with v1.1.76, when a loose table is missing, the plugin can copy it from `mods/<ModName>/d2rloader/plugins/basefiles-and-backups/basefiles/global/excel/` into the writable, unpacked mod. Use Ladik's Casc Viewer to extract originals from the same game data your mod uses. For example, save `data/global/excel/cubemain.txt` as `basefiles/global/excel/cubemain.txt`.
+
+Copies use the shared mod-install lock so they wait for other installers using the same lock. Setup only creates missing files, so it does not create backups. If the plugin reports that it added loose tables, exit and restart D2RLoader with the same mod to load them. If any required table is still missing, upgrades and downgrades stay disabled until you supply it.
+
+For the gem upgrade sound, the mod's loose `data/global/excel/sounds.txt` must contain a valid `shrine_gemupgrade` entry. This file is optional and is not copied by setup.
+
 ## Build from source
 
 Use CMake 3.29 or newer and a Visual Studio C++ toolchain:
@@ -75,4 +83,3 @@ CMake fetches the pinned D2RLoader PluginSDK revision. To build without fetching
 ## License
 
 MIT. See [LICENSE](LICENSE).
-

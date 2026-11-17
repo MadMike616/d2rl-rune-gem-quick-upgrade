@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -223,7 +224,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "0.1.76",
+    .version     = "1.1.76",
     .author      = "MadMike",
     .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -787,35 +788,6 @@ auto JsonStringField(std::string_view object, std::string_view key, std::string&
     return true;
 }
 
-auto JsonIntegerField(std::string_view object, std::string_view key, std::int32_t& value) -> bool {
-    std::string quotedKey;
-    quotedKey.reserve(key.size() + 2);
-    quotedKey.push_back('"');
-    quotedKey.append(key);
-    quotedKey.push_back('"');
-    const std::size_t keyPosition = object.find(quotedKey);
-    if (keyPosition == std::string_view::npos) {
-        return false;
-    }
-    const std::size_t colon = object.find(':', keyPosition + quotedKey.size());
-    if (colon == std::string_view::npos) {
-        return false;
-    }
-    std::size_t valueStart = colon + 1;
-    while (valueStart < object.size() && std::isspace(static_cast<unsigned char>(object[valueStart]))) {
-        ++valueStart;
-    }
-    std::size_t valueEnd = valueStart;
-    while (valueEnd < object.size() && (object[valueEnd] == '-' || std::isdigit(static_cast<unsigned char>(object[valueEnd])))) {
-        ++valueEnd;
-    }
-    if (valueStart == valueEnd) {
-        return false;
-    }
-    const auto parsed = std::from_chars(object.data() + valueStart, object.data() + valueEnd, value);
-    return parsed.ec == std::errc{} && parsed.ptr == object.data() + valueEnd;
-}
-
 auto LoadCraftingSlotLayoutsFromFile(const std::filesystem::path& layoutPath) -> bool {
     std::ifstream input(layoutPath, std::ios::binary);
     if (!input) {
@@ -869,6 +841,110 @@ auto LoadCraftingSlotLayouts(const D2RL::PluginContext* context,
     return LoadDefaultCraftingSlotLayouts();
 }
 
+
+namespace fs = std::filesystem;
+
+constexpr std::array<std::wstring_view, 5> RequiredExcelTables{
+    L"cubemain.txt", L"misc.txt", L"itemtypes.txt", L"armor.txt", L"weapons.txt" };
+
+auto ModNamePath(std::string_view name) -> fs::path {
+    return fs::path(std::u8string(name.begin(), name.end()));
+}
+
+auto SamePathPart(const fs::path& left, const fs::path& right) -> bool {
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+auto CheckedModChild(const fs::path& modRoot, const fs::path& relative) -> fs::path {
+    const auto path = modRoot / relative;
+    const auto resolved = fs::weakly_canonical(path);
+    auto it = resolved.begin();
+    for (const auto& part : modRoot) {
+        if (it == resolved.end() || !SamePathPart(*it, part)) {
+            throw std::runtime_error("a table path points outside the active mod");
+        }
+        ++it;
+    }
+    return path;
+}
+
+// Resolve a write destination only from the loader's active mod and scope.
+// A real MPQ archive cannot receive loose files.
+auto FindUnpackedModRoot(const D2RL::PluginContext* context) -> fs::path {
+    constexpr auto ActiveModEnd = offsetof(D2RL::PluginContext, activeMod) + sizeof(const char*);
+    constexpr auto ModDirectoryEnd = offsetof(D2RL::PluginContext, modDirectory) + sizeof(const wchar_t*);
+    constexpr auto ScopeRootEnd = offsetof(D2RL::PluginContext, scopeRootDirectory) + sizeof(const wchar_t*);
+    if (context->contextSize < ActiveModEnd || context->activeMod == nullptr
+        || context->activeMod[0] == '\0') {
+        return {};
+    }
+    const auto mod = ModNamePath(context->activeMod);
+    if (mod.has_root_path() || mod.has_parent_path() || mod == L"." || mod == L".."
+        || mod.native().find(L':') != std::wstring::npos) {
+        return {};
+    }
+    const fs::path package{mod.native() + L".mpq"};
+    const auto findIn = [&](const wchar_t* directory) -> fs::path {
+        if (directory == nullptr || directory[0] == L'\0') {
+            return {};
+        }
+        const auto root = fs::path(directory).lexically_normal();
+        if (!root.is_absolute()) {
+            return {};
+        }
+        if (SamePathPart(root.filename(), mod) && fs::is_directory(root)) {
+            return fs::canonical(root);
+        }
+        if (SamePathPart(root.filename(), package) && SamePathPart(root.parent_path().filename(), mod)
+            && fs::is_directory(root)) {
+            return fs::canonical(root.parent_path());
+        }
+        for (const auto& candidate : {root / mod, root / L"mods" / mod}) {
+            if (fs::is_directory(candidate / package) || fs::is_directory(candidate / L"data")) {
+                return fs::canonical(candidate);
+            }
+        }
+        return {};
+    };
+    if (context->contextSize >= ModDirectoryEnd) {
+        if (auto root = findIn(context->modDirectory); !root.empty()) {
+            return root;
+        }
+    }
+    return context->contextSize >= ScopeRootEnd ? findIn(context->scopeRootDirectory) : fs::path{};
+}
+
+// Use the same Windows mutex as the other D2RLoader first-run installers.
+class ModInstallLock {
+public:
+    ModInstallLock() {
+        handle_ = CreateMutexW(nullptr, FALSE, L"Local\\D2RLoader.ModFirstRunInstall.v1");
+        if (handle_ == nullptr) {
+            throw std::system_error(GetLastError(), std::system_category(), "creating the shared mod-install lock");
+        }
+        const auto wait = WaitForSingleObject(handle_, 60000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            const auto error = GetLastError();
+            CloseHandle(handle_);
+            if (wait == WAIT_TIMEOUT) {
+                throw std::runtime_error("timed out waiting for the shared mod-install lock");
+            }
+            throw std::system_error(error, std::system_category(), "acquiring the shared mod-install lock");
+        }
+    }
+
+    ModInstallLock(const ModInstallLock&) = delete;
+    auto operator=(const ModInstallLock&) -> ModInstallLock& = delete;
+
+    ~ModInstallLock() {
+        ReleaseMutex(handle_);
+        CloseHandle(handle_);
+    }
+
+private:
+    HANDLE handle_{};
+};
+
 auto ExcelDirectoryFromContext(const D2RL::PluginContext* context) -> std::filesystem::path {
     if (context == nullptr) {
         return {};
@@ -919,24 +995,25 @@ auto ExcelDirectoryFromContext(const D2RL::PluginContext* context) -> std::files
         }
     };
 
-    const auto modName = activeMod.empty() ? std::filesystem::path{} : std::filesystem::path(activeMod);
+    const auto modName = activeMod.empty() ? std::filesystem::path{} : ModNamePath(activeMod);
     for (const auto& root : roots) {
         addExcel(root);
         if (!activeMod.empty()) {
-            addExcel(root / std::filesystem::path(activeMod + ".mpq"));
+            const fs::path package{modName.native() + L".mpq"};
+            addExcel(root / package);
             addExcel(root / modName);
-            addExcel(root / modName / std::filesystem::path(activeMod + ".mpq"));
+            addExcel(root / modName / package);
+            addExcel(root / L"mods" / modName / package);
+            addExcel(root / L"mods" / modName);
         }
     }
-    constexpr std::array<std::wstring_view, 5> SupportedTables{
-        L"cubemain.txt", L"misc.txt", L"itemtypes.txt", L"armor.txt", L"weapons.txt" };
     for (const auto& candidate : candidates) {
         std::error_code error;
         const auto layoutPath = candidate.parent_path() / L"ui" / L"layouts" / L"bankexpansionlayouthd.json";
         if (std::filesystem::is_regular_file(layoutPath, error)) {
             return candidate;
         }
-        for (const auto table : SupportedTables) {
+        for (const auto table : RequiredExcelTables) {
             error.clear();
             if (std::filesystem::is_regular_file(candidate / table, error)) {
                 return candidate;
@@ -946,151 +1023,89 @@ auto ExcelDirectoryFromContext(const D2RL::PluginContext* context) -> std::files
     return {};
 }
 
-auto RuntimeBuildNumber(const D2RL::PluginContext* context) noexcept -> std::int32_t {
-    if (context == nullptr) {
+auto InstallMissingBaseTables(const D2RL::PluginContext* context) -> std::size_t {
+    const auto modRoot = FindUnpackedModRoot(context);
+    if (modRoot.empty()) {
         return 0;
     }
-    constexpr std::uint32_t BuildVersionFieldEnd = static_cast<std::uint32_t>(
-        offsetof(D2RL::PluginContext, buildVersion) + sizeof(const char*));
-    if (context->contextSize >= BuildVersionFieldEnd && context->buildVersion != nullptr) {
-        const std::string_view version(context->buildVersion);
-        const std::size_t separator = version.find_last_of('.');
-        if (separator != std::string_view::npos) {
-            std::uint32_t build{};
-            if (ParseUnsigned(version.substr(separator + 1), build)
-                && build > 10000 && build <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-                return static_cast<std::int32_t>(build);
-            }
+    const auto baseExcel = CheckedModChild(modRoot,
+        L"d2rloader/plugins/basefiles-and-backups/basefiles/global/excel");
+    if (!fs::is_directory(baseExcel)) {
+        return 0;
+    }
+
+    const ModInstallLock lock;
+    const auto package = CheckedModChild(modRoot, ModNamePath(context->activeMod).native() + L".mpq");
+    const bool unpacked = fs::is_directory(package);
+    if (!unpacked && (fs::exists(package) || !fs::is_directory(modRoot / L"data"))) {
+        return 0;
+    }
+    const auto excel = CheckedModChild(modRoot, (unpacked ? package.filename() : fs::path{})
+        / L"data/global/excel");
+    const auto activeExcel = ExcelDirectoryFromContext(context);
+    if (!activeExcel.empty() && !SamePathPart(fs::weakly_canonical(activeExcel), fs::weakly_canonical(excel))) {
+        // Do not install into a different data tree than the one selected for reading.
+        return 0;
+    }
+
+    std::vector<std::wstring_view> missing;
+    for (const auto file : RequiredExcelTables) {
+        const auto target = excel / file;
+        if (fs::symlink_status(target).type() == fs::file_type::not_found
+            && fs::is_regular_file(CheckedModChild(modRoot, (baseExcel / file).lexically_relative(modRoot)))) {
+            missing.push_back(file);
         }
     }
-    constexpr std::uint32_t ModDataBuildFieldEnd = static_cast<std::uint32_t>(
-        offsetof(D2RL::PluginContext, modDataVersionBuild) + sizeof(std::uint32_t));
-    if (context->contextSize >= ModDataBuildFieldEnd
-        && context->modDataVersionBuild > 0
-        && context->modDataVersionBuild <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        return static_cast<std::int32_t>(context->modDataVersionBuild);
+    if (missing.empty()) {
+        return 0;
     }
-    return 0;
-}
 
-auto CompiledExcelBuild(const std::filesystem::path& excelDirectory, std::int32_t& build) -> bool {
-    const auto versionDirectory = excelDirectory.parent_path().parent_path().parent_path();
-    std::ifstream manifest(versionDirectory / L"manifest.json", std::ios::binary);
-    if (!manifest) {
-        return false;
+    fs::create_directories(excel);
+    const auto staging = excel / (L".rune-gem-quick-upgrade-install-"
+        + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    if (!fs::create_directory(staging)) {
+        throw std::runtime_error("could not create a staging directory for loose tables");
     }
-    const std::string json{std::istreambuf_iterator<char>(manifest), std::istreambuf_iterator<char>()};
-    return JsonIntegerField(json, "gameBuild", build);
-}
-
-auto CompiledExcelDirectoryFromContext(const D2RL::PluginContext* context,
-    const std::filesystem::path& activeExcelDirectory) -> std::filesystem::path {
-    std::vector<std::filesystem::path> candidates;
-    auto addCandidatesFrom = [&candidates](std::filesystem::path ancestor) -> bool {
-        for (std::uint32_t depth = 0; depth < 8 && !ancestor.empty(); ++depth) {
-            const auto compilerRoot = ancestor / L"d2rloader" / L"data" / L"compiler";
-            std::error_code error;
-            if (std::filesystem::is_directory(compilerRoot, error)) {
-                for (std::filesystem::directory_iterator it(compilerRoot, error), end;
-                    !error && it != end; it.increment(error)) {
-                    if (!it->is_directory(error)) {
-                        continue;
-                    }
-                    const auto excel = it->path() / L"data" / L"global" / L"excel";
-                    std::error_code fileError;
-                    if (!std::filesystem::is_regular_file(it->path() / L"manifest.json", fileError)) {
-                        continue;
-                    }
-                    constexpr std::array<std::wstring_view, 5> SupportedTables{
-                        L"cubemain.txt", L"misc.txt", L"itemtypes.txt", L"armor.txt", L"weapons.txt" };
-                    bool hasSupportedTable = false;
-                    for (const auto table : SupportedTables) {
-                        fileError.clear();
-                        if (std::filesystem::is_regular_file(excel / table, fileError)) {
-                            hasSupportedTable = true;
-                            break;
-                        }
-                    }
-                    if (!hasSupportedTable) {
-                        continue;
-                    }
-                    const auto normalized = excel.lexically_normal();
-                    if (std::find(candidates.begin(), candidates.end(), normalized) == candidates.end()) {
-                        candidates.push_back(normalized);
-                    }
-                }
-                if (!candidates.empty()) {
-                    return true;
-                }
-            }
-            const auto parent = ancestor.parent_path();
-            if (parent == ancestor) {
-                break;
-            }
-            ancestor = parent;
+    const auto cleanup = [&]() noexcept {
+        std::error_code ignored;
+        for (const auto file : missing) {
+            fs::remove(staging / file, ignored);
         }
-        return false;
+        fs::remove(staging, ignored);
     };
-
-    const bool foundFromActiveData = addCandidatesFrom(activeExcelDirectory);
-    if (!foundFromActiveData && context != nullptr) {
-        constexpr std::uint32_t ModDirectoryFieldEnd = static_cast<std::uint32_t>(
-            offsetof(D2RL::PluginContext, modDirectory) + sizeof(const wchar_t*));
-        if (context->contextSize >= ModDirectoryFieldEnd && context->modDirectory != nullptr) {
-            (void)addCandidatesFrom(std::filesystem::path(context->modDirectory));
+    std::size_t copied{};
+    try {
+        for (const auto file : missing) {
+            fs::copy_file(baseExcel / file, staging / file);
         }
-        constexpr std::uint32_t ScopeRootFieldEnd = static_cast<std::uint32_t>(
-            offsetof(D2RL::PluginContext, scopeRootDirectory) + sizeof(const wchar_t*));
-        if (candidates.empty() && context->contextSize >= ScopeRootFieldEnd && context->scopeRootDirectory != nullptr) {
-            (void)addCandidatesFrom(std::filesystem::path(context->scopeRootDirectory));
-        }
-    }
-    if (candidates.empty()) {
-        return {};
-    }
-
-    const std::int32_t runtimeBuild = RuntimeBuildNumber(context);
-    if (runtimeBuild > 0) {
-        std::filesystem::path matching;
-        for (const auto& candidate : candidates) {
-            std::int32_t candidateBuild{};
-            if (CompiledExcelBuild(candidate, candidateBuild) && candidateBuild == runtimeBuild) {
-                if (!matching.empty()) {
-                    return {};
+        for (const auto file : missing) {
+            const auto target = excel / file;
+            // Publish the complete file without replacing anything that appeared in the meantime.
+            if (!MoveFileExW((staging / file).c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                const auto error = GetLastError();
+                if ((error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) && fs::is_regular_file(target)) {
+                    continue;
                 }
-                matching = candidate;
+                throw std::system_error(error, std::system_category(), "could not add " + target.filename().string());
             }
+            ++copied;
         }
-        if (!matching.empty()) {
-            return matching;
-        }
+    } catch (...) {
+        cleanup();
+        throw;
     }
-    return candidates.size() == 1 ? candidates.front() : std::filesystem::path{};
+    cleanup();
+    return copied;
 }
 
-auto ReadModOrCompiledTable(const std::filesystem::path& activeExcelDirectory,
-    const std::filesystem::path& compiledExcelDirectory,
-    std::wstring_view filename,
-    Table& table,
-    bool& usedCompiledFallback) -> bool {
-    usedCompiledFallback = false;
-    if (!activeExcelDirectory.empty()) {
-        std::error_code error;
-        const auto activePath = activeExcelDirectory / filename;
-        if (std::filesystem::is_regular_file(activePath, error)) {
-            return ReadTable(activePath, table);
-        }
+auto ReadLooseTable(const std::filesystem::path& excelDirectory,
+    std::wstring_view filename, Table& table) -> bool {
+    if (excelDirectory.empty()) {
+        return false;
     }
-    if (!compiledExcelDirectory.empty()) {
-        const auto compiledPath = compiledExcelDirectory / filename;
-        std::error_code error;
-        if (std::filesystem::is_regular_file(compiledPath, error)
-            && ReadTable(compiledPath, table)) {
-            usedCompiledFallback = true;
-            return true;
-        }
-    }
-    return false;
+    const auto path = excelDirectory / filename;
+    std::error_code error;
+    return std::filesystem::is_regular_file(path, error) && ReadTable(path, table);
 }
 
 auto ReadGemUpgradeSoundId(const Table& sounds) -> std::uint16_t {
@@ -1133,34 +1148,12 @@ auto ReadGemUpgradeSoundId(const Table& sounds) -> std::uint16_t {
 }
 
 auto LoadGemUpgradeSound(const D2RL::PluginContext* context,
-    const std::filesystem::path& activeExcelDirectory,
-    const std::filesystem::path& compiledExcelDirectory) -> void {
-    GemUpgradeSoundId = 0;
+    const std::filesystem::path& excelDirectory) -> void {
     Table sounds;
-    bool usedCompiledFallback{};
-    if (ReadModOrCompiledTable(activeExcelDirectory, compiledExcelDirectory,
-            L"sounds.txt", sounds, usedCompiledFallback)) {
-        GemUpgradeSoundId = ReadGemUpgradeSoundId(sounds);
-    }
-
-    // A mod may ship a partial sounds.txt. If it has no gem-upgrade row,
-    // fall back to D2RLoader's merged base table for that sound event.
-    if (GemUpgradeSoundId == 0 && !usedCompiledFallback && !compiledExcelDirectory.empty()) {
-        Table compiledSounds;
-        std::error_code error;
-        const auto compiledPath = compiledExcelDirectory / L"sounds.txt";
-        if (std::filesystem::is_regular_file(compiledPath, error) && ReadTable(compiledPath, compiledSounds)) {
-            GemUpgradeSoundId = ReadGemUpgradeSoundId(compiledSounds);
-            usedCompiledFallback = GemUpgradeSoundId != 0;
-        }
-    }
-
-    if (context == nullptr) {
-        return;
-    }
-    if (GemUpgradeSoundId == 0) {
-        context->LogWarn("Gem upgrade sound disabled: sounds.txt has no valid shrine_gemupgrade entry.");
-        return;
+    GemUpgradeSoundId = ReadLooseTable(excelDirectory, L"sounds.txt", sounds)
+        ? ReadGemUpgradeSoundId(sounds) : 0;
+    if (context != nullptr && GemUpgradeSoundId == 0) {
+        context->LogWarn("Gem upgrade sound disabled: the mod's loose sounds.txt is missing or has no valid shrine_gemupgrade entry.");
     }
 }
 
@@ -1278,29 +1271,26 @@ auto LoadRecipes(const D2RL::PluginContext* context) -> bool {
     GemItemCodes.clear();
     RuneItemCodes.clear();
     const auto excelDirectory = ExcelDirectoryFromContext(context);
-    const auto compiledExcelDirectory = CompiledExcelDirectoryFromContext(context, excelDirectory);
     (void)LoadCraftingSlotLayouts(context, excelDirectory);
-    LoadGemUpgradeSound(context, excelDirectory, compiledExcelDirectory);
+    LoadGemUpgradeSound(context, excelDirectory);
 
     Table cube;
     Table misc;
     Table types;
     Table armor;
     Table weapons;
-    bool cubeFallback{};
-    bool miscFallback{};
-    bool typesFallback{};
-    bool armorFallback{};
-    bool weaponsFallback{};
-    if (!ReadModOrCompiledTable(excelDirectory, compiledExcelDirectory, L"cubemain.txt", cube, cubeFallback)
-        || !ReadModOrCompiledTable(excelDirectory, compiledExcelDirectory, L"misc.txt", misc, miscFallback)
-        || !ReadModOrCompiledTable(excelDirectory, compiledExcelDirectory, L"itemtypes.txt", types, typesFallback)
-        || !ReadModOrCompiledTable(excelDirectory, compiledExcelDirectory, L"armor.txt", armor, armorFallback)
-        || !ReadModOrCompiledTable(excelDirectory, compiledExcelDirectory, L"weapons.txt", weapons, weaponsFallback)) {
-        if (context != nullptr) {
-            context->LogWarn("Rune Gem Quick Upgrade could not read the required cubemain.txt, misc.txt, itemtypes.txt, armor.txt, or weapons.txt tables from the mod or D2RLoader compiled cache.");
+    const std::array tables{&cube, &misc, &types, &armor, &weapons};
+    static_assert(tables.size() == RequiredExcelTables.size());
+    for (std::size_t i = 0; i < RequiredExcelTables.size(); ++i) {
+        const auto filename = RequiredExcelTables[i];
+        if (!ReadLooseTable(excelDirectory, filename, *tables[i])) {
+            if (context != nullptr) {
+                const auto message = "Rune Gem Quick Upgrade could not read " + std::filesystem::path(filename).string()
+                    + " from the active mod's loose data/global/excel folder. Supply the table there or in the mod's basefiles/global/excel folder, then restart D2RLoader.";
+                context->LogWarn(message.c_str());
+            }
+            return false;
         }
-        return false;
     }
 
     const std::int32_t armorRecordCount = CountItemRecords(armor);
@@ -3227,9 +3217,6 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         GemUpgradeSoundId = 0;
         LoggedGemUpgradeSoundUnavailable.store(false, std::memory_order_relaxed);
         LoadPluginConfig(context);
-        if (!LoadRecipes(context)) {
-            context->LogWarn("Rune Gem Quick Upgrade loaded without any usable active-mod recipes.");
-        }
 
         if (context->QueryService(&InventoryService) != D2RL::ServiceQueryResult::Success
             || !D2RL::HasInventoryServiceField(InventoryService, D2RL::InventoryServiceRequiredSize)
@@ -3240,6 +3227,23 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
             || !D2RL::HasThreadServiceField(ThreadService, D2RL::ThreadServiceRequiredSize)) {
             context->LogWarn("Rune Gem Quick Upgrade requires inventory, shared-stash item transaction, and game-thread services.");
             return false;
+        }
+
+        try {
+            if (const auto copied = InstallMissingBaseTables(context); copied != 0) {
+                const auto message = "Rune Gem Quick Upgrade added " + std::to_string(copied)
+                    + " missing loose table(s) from basefiles. Exit and restart D2RLoader with the same mod to enable upgrades and downgrades.";
+                context->LogInfo(message.c_str());
+                return true;
+            }
+        } catch (const std::exception& error) {
+            const auto message = std::string("Rune Gem Quick Upgrade could not install missing loose tables: ")
+                + error.what() + ". Check the mod files and restart D2RLoader.";
+            context->LogError(message.c_str());
+            return false;
+        }
+        if (!LoadRecipes(context)) {
+            context->LogWarn("Rune Gem Quick Upgrade loaded without any usable active-mod recipes.");
         }
 
         LoadContext = context;
