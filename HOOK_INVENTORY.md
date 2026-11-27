@@ -6,9 +6,9 @@
 |---|---|
 | Plugin name | Rune Gem Quick Upgrade |
 | Plugin ID | rune-gem-quick-upgrade |
-| Release version | 1.1.76 |
-| Inventory updated | 2026-11-17 |
-| Source revision | Tag v1.1.76 |
+| Release version | 1.1.77 |
+| Inventory updated | 2026-11-27 |
+| Source revision | v1.1.77 release source |
 | D2R build(s) audited | Not validated |
 | D2RLoader SDK / Plugin ABI | SDK 0.4.0 / Plugin ABI 4 |
 | Audit status | Complete |
@@ -38,3 +38,5 @@ None identified in the current inventory; this is not a compatibility guarantee.
 ## Audit notes
 
 The plugin reads Advanced Stash and inventory vtable entries to confirm widget types but does not replace those entries. Modifier listeners use D2RLoader's input service with a keyboard-state fallback; no operating-system input hook is installed. No game build was validated. The first launch installer uses a named Windows mutex to serialize table copies. It does not install an input or message hook. The existing identified flag write updates a live item instance rather than game code or a shared slot.
+
+Release 1.1.77 source review: TOML installation completion and configuration mirroring add no native hook, patch, vtable, or OS input-hook targets. Hook-site changes since the previous release: none. Startup completion was checked in the testing environment; the existing native validation limits above still apply.

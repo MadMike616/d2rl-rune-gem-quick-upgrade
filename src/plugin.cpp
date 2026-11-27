@@ -1,3 +1,4 @@
+#include "install_token.hpp"
 #include <D2RLPlugin/api.h>
 
 #include <Windows.h>
@@ -224,7 +225,7 @@ constexpr D2RL::PluginInfo PluginInfo {
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginId,
     .name        = "Rune Gem Quick Upgrade",
-    .version     = "1.1.76",
+    .version     = "1.1.77",
     .author      = "MadMike",
     .description = "Upgrade with Shift + right-click; downgrade with Alt + right-click.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
@@ -1030,11 +1031,8 @@ auto InstallMissingBaseTables(const D2RL::PluginContext* context) -> std::size_t
     }
     const auto baseExcel = CheckedModChild(modRoot,
         L"d2rloader/plugins/basefiles-and-backups/basefiles/global/excel");
-    if (!fs::is_directory(baseExcel)) {
-        return 0;
-    }
-
     const ModInstallLock lock;
+    if (InstallToken::Complete(*context)) return 0;
     const auto package = CheckedModChild(modRoot, ModNamePath(context->activeMod).native() + L".mpq");
     const bool unpacked = fs::is_directory(package);
     if (!unpacked && (fs::exists(package) || !fs::is_directory(modRoot / L"data"))) {
@@ -1048,6 +1046,11 @@ auto InstallMissingBaseTables(const D2RL::PluginContext* context) -> std::size_t
         return 0;
     }
 
+    const auto finish=[&]() {
+        if (std::all_of(RequiredExcelTables.begin(),RequiredExcelTables.end(),
+                [&](auto name){return fs::is_regular_file(excel/name);}))
+            InstallToken::Commit(*context);
+    };
     std::vector<std::wstring_view> missing;
     for (const auto file : RequiredExcelTables) {
         const auto target = excel / file;
@@ -1057,6 +1060,7 @@ auto InstallMissingBaseTables(const D2RL::PluginContext* context) -> std::size_t
         }
     }
     if (missing.empty()) {
+        finish();
         return 0;
     }
 
@@ -1095,6 +1099,7 @@ auto InstallMissingBaseTables(const D2RL::PluginContext* context) -> std::size_t
         throw;
     }
     cleanup();
+    finish();
     return copied;
 }
 
